@@ -1,0 +1,62 @@
+# cloudcleaner configuration example
+#
+# Usage:
+#   cloudcleaner scan       --config rules.yaml          # dry run + savings report
+#   cloudcleaner quarantine --config rules.yaml --apply  # move candidates to quarantine
+#   cloudcleaner batches    --config rules.yaml          # inspect quarantine
+#   cloudcleaner purge      --config rules.yaml --apply  # delete expired batches for good
+#   cloudcleaner restore    --config rules.yaml --batch 20260715T102530Z
+
+provider: s3                 # 's3' (also MinIO/R2 via endpoint_url) or 'memory'
+bucket: acme-corp-data
+# region: eu-south-1
+# endpoint_url: https://minio.internal:9000   # for S3-compatible storage
+# prefix: department-a/     # only scan under this prefix
+
+# An object is a cleanup candidate when ALL conditions of at least one
+# rule hold. Conditions available per rule:
+#   keywords:        case-insensitive substrings of the object key
+#   match_regex:     regular expression on the object key
+#   prefixes:        key must start with one of these
+#   suffixes:        key must end with one of these (file extensions)
+#   older_than:      ISO date ("2016-01-01") or period ("90d", "6m", "10y")
+#   min_size:        e.g. "500KB", "1GB", or plain bytes
+#   storage_classes: e.g. [STANDARD, STANDARD_IA]
+rules:
+  - name: stale-logs
+    keywords: [log]
+    older_than: 90d
+
+  - name: temp-artifacts
+    suffixes: [.tmp, .bak, .old]
+
+  # Legal retention (prescription) period: invoices older than 10 years
+  - name: invoices-past-retention
+    prefixes: [invoices/]
+    older_than: 10y
+
+  - name: big-old-backups
+    prefixes: [backups/]
+    older_than: 1y
+    min_size: 1GB
+
+# Never touched, no matter what the rules say. A pattern ending in '/'
+# protects the whole subtree; otherwise it is a glob on the full key.
+exclude:
+  - legal-hold/
+  - "*.db"
+
+# Candidates are moved here first and only deleted for good by `purge`
+# once retention_days have passed. `restore` undoes a batch.
+quarantine:
+  prefix: _cloudcleaner/quarantine/
+  retention_days: 30
+  # bucket: acme-corp-quarantine   # optional separate bucket
+
+# Cost model: defaults to public AWS S3 us-east-1 prices (USD/GB-month).
+# Override per storage class to match your region or negotiated rates.
+pricing:
+  currency: USD
+  # overrides:
+  #   STANDARD: 0.024
+  #   STANDARD_IA: 0.0131
