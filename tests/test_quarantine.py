@@ -64,7 +64,11 @@ class TestQuarantineLifecycle:
         freed = later.purge(expired)
         assert freed == 150
         assert later.list_batches() == []
-        assert not any(k.startswith(config.quarantine.prefix) for k in keys(adapter, config.bucket))
+        # No per-batch objects/manifests survive the purge...
+        batch_prefix = f"{config.quarantine.prefix}{manifest.batch_id}/"
+        assert not any(k.startswith(batch_prefix) for k in keys(adapter, config.bucket))
+        # ...but the audit log (inside the prefix, by design) does.
+        assert later._audit_key() in keys(adapter, config.bucket)
 
     def test_restore_whole_batch(self, config, adapter):
         manager = QuarantineManager(adapter, config, now=NOW)

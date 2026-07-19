@@ -12,8 +12,15 @@ import sys
 
 from cloudcleaner.adapters import get_adapter
 from cloudcleaner.config import Config, ConfigError, load_config
-from cloudcleaner.quarantine import QuarantineManager
-from cloudcleaner.report import compute_savings, human_size, json_report, text_report
+from cloudcleaner.quarantine import ManifestIntegrityError, QuarantineManager
+from cloudcleaner.report import (
+    compute_savings,
+    csv_report,
+    html_report,
+    human_size,
+    json_report,
+    text_report,
+)
 from cloudcleaner.rules import RuleEngine
 
 
@@ -24,21 +31,34 @@ def _load(args) -> Config:
     return config
 
 
-def _scan(config: Config, adapter):
-    engine = RuleEngine(config)
+def _scan(config: Config, adapter, now=None):
+    engine = RuleEngine(config, now=now)
     return engine.scan(adapter.list_objects(config.bucket, prefix=config.prefix))
 
 
 def cmd_scan(args) -> int:
     config = _load(args)
     adapter = get_adapter(config)
-    result = _scan(config, adapter)
+    now = None
+    if getattr(args, "as_of", None):
+        from datetime import datetime, timezone
+
+        from cloudcleaner.config import parse_cutoff
+
+        now = parse_cutoff(args.as_of, datetime.now(timezone.utc))
+    result = _scan(config, adapter, now=now)
     savings = compute_savings(result, config.pricing)
-    output = (
-        json_report(result, savings)
-        if args.json
-        else text_report(result, savings, config.quarantine.retention_days, limit=args.limit)
-    )
+    # --json is a deprecated alias for --format json; honor it when set.
+    fmt = "json" if getattr(args, "json", False) else args.format
+    retention = config.quarantine.retention_days
+    if fmt == "json":
+        output = json_report(result, savings)
+    elif fmt == "html":
+        output = html_report(result, savings, retention)
+    elif fmt == "csv":
+        output = csv_report(result, savings)
+    else:
+        output = text_report(result, savings, retention, limit=args.limit)
     if args.output:
         with open(args.output, "w", encoding="utf-8") as fh:
             fh.write(output + "\n")
@@ -106,6 +126,28 @@ def cmd_purge(args) -> int:
         )
         return 0
 
+    # About to permanently delete: show every key and require confirmation.
+    all_keys = [e.original_key for m in batches for e in m.entries]
+    print(f"\nThe following {len(all_keys)} object(s) will be PERMANENTLY deleted:")
+    for key in all_keys:
+        print(f"  {key}")
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print(
+                "\nRefusing to purge without confirmation in a non-interactive session. "
+                "Re-run with --yes to confirm permanent deletion.",
+                file=sys.stderr,
+            )
+            return 1
+        answer = input(
+            f"\nType 'yes' to permanently delete {human_size(total)} across "
+            f"{len(batches)} batch(es): "
+        )
+        if answer.strip().lower() != "yes":
+            print("Aborted; nothing was deleted.")
+            return 1
+
     freed = manager.purge(batches)
     print(f"Permanently deleted {human_size(freed)} across {len(batches)} batch(es).")
     return 0
@@ -149,9 +191,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("scan", help="dry-run: list candidates and estimated savings")
     add_common(p)
-    p.add_argument("--json", action="store_true", help="emit a machine-readable JSON report")
+    p.add_argument(
+        "--format",
+        choices=["text", "json", "html", "csv"],
+        default="text",
+        help="report format (default: text)",
+    )
+    # Deprecated alias for --format json, kept for backward compatibility.
+    p.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--output", "-o", help="write the report to a file instead of stdout")
     p.add_argument("--limit", type=int, default=20, help="max candidates shown in text report")
+    p.add_argument(
+        "--as-of",
+        dest="as_of",
+        help="preview candidates as if it were this ISO date (e.g. 2027-01-01)",
+    )
     p.set_defaults(func=cmd_scan)
 
     p = sub.add_parser("quarantine", help="move matching objects into quarantine")
@@ -169,6 +223,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--apply", action="store_true", help="actually delete (default: dry run)")
     p.add_argument("--force", action="store_true", help="include batches still in retention")
     p.add_argument("--batch", help="limit the purge to one batch id")
+    p.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="skip the interactive confirmation prompt before permanent deletion",
+    )
     p.set_defaults(func=cmd_purge)
 
     p = sub.add_parser("restore", help="bring quarantined objects back to their original keys")
@@ -190,6 +250,9 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
+    except ManifestIntegrityError as exc:
+        print(f"integrity error: {exc}", file=sys.stderr)
+        return 1
     except FileNotFoundError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

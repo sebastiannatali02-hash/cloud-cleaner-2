@@ -8,6 +8,7 @@ then `restore` can put any of them back exactly where they were.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,31 @@ from cloudcleaner.config import Config
 from cloudcleaner.models import Candidate
 
 MANIFEST_NAME = "manifest.json"
+AUDIT_NAME = "audit.log"
+
+
+class ManifestIntegrityError(Exception):
+    """Raised when a manifest's stored checksum does not match its entries.
+
+    A mismatch means the manifest was tampered with or corrupted, so the
+    list of quarantined objects can no longer be trusted. Callers must
+    refuse to purge or restore such a batch.
+    """
+
+
+def _entries_digest(entries: list["ManifestEntry"]) -> str:
+    """SHA-256 over a canonical serialization of the manifest entries.
+
+    Entry order is preserved (it mirrors the objects as quarantined) while
+    the keys within each entry are sorted and whitespace is stripped so the
+    digest is stable regardless of how the JSON happens to be formatted.
+    """
+    canonical = json.dumps(
+        [vars(e) for e in entries],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -35,10 +61,18 @@ class Manifest:
     created_at: str
     purge_after: str
     entries: list[ManifestEntry] = field(default_factory=list)
+    # True once ``from_json`` has confirmed the stored checksum, or for a
+    # freshly built manifest. False only for a legacy manifest that carried
+    # no checksum field (accepted for backward compatibility but unverified).
+    integrity_verified: bool = True
 
     @property
     def total_bytes(self) -> int:
         return sum(e.size_bytes for e in self.entries)
+
+    @property
+    def checksum(self) -> str:
+        return _entries_digest(self.entries)
 
     def is_expired(self, now: datetime) -> bool:
         return datetime.fromisoformat(self.purge_after) <= now
@@ -51,6 +85,7 @@ class Manifest:
                 "quarantine_bucket": self.quarantine_bucket,
                 "created_at": self.created_at,
                 "purge_after": self.purge_after,
+                "checksum": self.checksum,
                 "entries": [vars(e) for e in self.entries],
             },
             indent=2,
@@ -60,7 +95,18 @@ class Manifest:
     def from_json(cls, text: str) -> "Manifest":
         data = json.loads(text)
         entries = [ManifestEntry(**e) for e in data.pop("entries", [])]
-        return cls(entries=entries, **data)
+        stored = data.pop("checksum", None)
+        if stored is not None:
+            actual = _entries_digest(entries)
+            if stored != actual:
+                batch = data.get("batch_id", "<unknown>")
+                raise ManifestIntegrityError(
+                    f"manifest for batch {batch!r} failed integrity check: "
+                    f"stored checksum {stored} != computed {actual}. "
+                    "The manifest may have been tampered with or corrupted; "
+                    "refusing to trust its contents."
+                )
+        return cls(entries=entries, integrity_verified=stored is not None, **data)
 
 
 class QuarantineManager:
@@ -73,6 +119,48 @@ class QuarantineManager:
 
     def _manifest_key(self, batch_id: str) -> str:
         return f"{self.prefix}{batch_id}/{MANIFEST_NAME}"
+
+    def _audit_key(self) -> str:
+        """Key of the append-only audit log.
+
+        The log records every quarantine/restore/purge and lives *inside*
+        the quarantine prefix. That placement is deliberate on two counts:
+
+        * ``purge`` only ever deletes the specific per-batch object and
+          manifest keys it is given — it never blanket-wipes the prefix —
+          so the audit trail survives every purge.
+        * the rule engine always excludes the quarantine prefix, so the
+          audit log can never itself be matched as a cleanup candidate
+          (an audit log named ``audit.log`` would otherwise be caught by a
+          ``keyword: log`` rule and quarantined/deleted).
+        """
+        return f"{self.prefix}{AUDIT_NAME}"
+
+    def _append_audit(
+        self, action: str, batch_id: str, entries: list[ManifestEntry]
+    ) -> None:
+        record = {
+            "timestamp": self.now.isoformat(),
+            "action": action,
+            "batch_id": batch_id,
+            "object_count": len(entries),
+            "total_bytes": sum(e.size_bytes for e in entries),
+            "keys": [e.original_key for e in entries],
+        }
+        line = json.dumps(record, sort_keys=True)
+        try:
+            existing = self.adapter.get_text(self.q_bucket, self._audit_key())
+        except KeyError:
+            existing = ""
+        self.adapter.put_text(self.q_bucket, self._audit_key(), existing + line + "\n")
+
+    def read_audit_log(self) -> list[dict]:
+        """Return the audit entries, oldest first (empty if none yet)."""
+        try:
+            text = self.adapter.get_text(self.q_bucket, self._audit_key())
+        except KeyError:
+            return []
+        return [json.loads(line) for line in text.splitlines() if line.strip()]
 
     def quarantine(self, candidates: list[Candidate]) -> Manifest:
         """Move candidates under the quarantine prefix and write the manifest."""
@@ -98,6 +186,7 @@ class QuarantineManager:
                 )
             )
         self.adapter.put_text(self.q_bucket, self._manifest_key(batch_id), manifest.to_json())
+        self._append_audit("quarantine", batch_id, manifest.entries)
         return manifest
 
     def list_batches(self) -> list[Manifest]:
@@ -118,6 +207,7 @@ class QuarantineManager:
                 self.adapter.delete(self.q_bucket, entry.quarantine_key)
                 freed += entry.size_bytes
             self.adapter.delete(self.q_bucket, self._manifest_key(manifest.batch_id))
+            self._append_audit("purge", manifest.batch_id, manifest.entries)
         return freed
 
     def restore(self, batch_id: str, keys: list[str] | None = None) -> list[ManifestEntry]:
@@ -151,4 +241,5 @@ class QuarantineManager:
             self.adapter.put_text(self.q_bucket, self._manifest_key(batch_id), manifest.to_json())
         else:
             self.adapter.delete(self.q_bucket, self._manifest_key(batch_id))
+        self._append_audit("restore", batch_id, restored)
         return restored

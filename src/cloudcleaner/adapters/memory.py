@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterator
+from typing import Iterable, Iterator
 
 from cloudcleaner.models import StorageObject
 
@@ -34,6 +34,11 @@ class MemoryAdapter:
 
     def delete(self, bucket: str, key: str) -> None:
         self.buckets.get(bucket, {}).pop(key, None)
+
+    def delete_many(self, bucket: str, keys: Iterable[str]) -> None:
+        store = self.buckets.get(bucket, {})
+        for key in keys:
+            store.pop(key, None)
 
     def put_text(self, bucket: str, key: str, text: str) -> None:
         from datetime import datetime, timezone
