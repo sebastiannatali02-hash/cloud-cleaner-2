@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -19,6 +20,11 @@ from cloudcleaner.models import Candidate
 
 MANIFEST_NAME = "manifest.json"
 AUDIT_NAME = "audit.log"
+
+# S3 copy/delete are network-bound, so a moderate thread pool gives a
+# near-linear speedup when quarantining thousands of objects. Kept modest
+# to stay well under S3 request-rate limits per prefix.
+DEFAULT_MAX_WORKERS = 16
 
 
 class ManifestIntegrityError(Exception):
@@ -110,12 +116,19 @@ class Manifest:
 
 
 class QuarantineManager:
-    def __init__(self, adapter: StorageAdapter, config: Config, now: datetime | None = None):
+    def __init__(
+        self,
+        adapter: StorageAdapter,
+        config: Config,
+        now: datetime | None = None,
+        max_workers: int = DEFAULT_MAX_WORKERS,
+    ):
         self.adapter = adapter
         self.config = config
         self.now = now or datetime.now(timezone.utc)
         self.prefix = config.quarantine.prefix
         self.q_bucket = config.quarantine.bucket or config.bucket
+        self.max_workers = max(1, max_workers)
 
     def _manifest_key(self, batch_id: str) -> str:
         return f"{self.prefix}{batch_id}/{MANIFEST_NAME}"
@@ -173,18 +186,25 @@ class QuarantineManager:
             created_at=self.now.isoformat(),
             purge_after=purge_after.isoformat(),
         )
-        for cand in candidates:
+        def _move(cand: Candidate) -> ManifestEntry:
             q_key = f"{self.prefix}{batch_id}/objects/{cand.obj.key}"
             self.adapter.copy(self.config.bucket, cand.obj.key, self.q_bucket, q_key)
             self.adapter.delete(self.config.bucket, cand.obj.key)
-            manifest.entries.append(
-                ManifestEntry(
-                    original_key=cand.obj.key,
-                    quarantine_key=q_key,
-                    size_bytes=cand.obj.size_bytes,
-                    rule=cand.rule_name,
-                )
+            return ManifestEntry(
+                original_key=cand.obj.key,
+                quarantine_key=q_key,
+                size_bytes=cand.obj.size_bytes,
+                rule=cand.rule_name,
             )
+
+        # Copy+delete are network-bound; run them concurrently. executor.map
+        # preserves input order, so the manifest entries stay deterministic.
+        workers = min(self.max_workers, len(candidates)) or 1
+        if workers == 1:
+            manifest.entries = [_move(c) for c in candidates]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                manifest.entries = list(pool.map(_move, candidates))
         self.adapter.put_text(self.q_bucket, self._manifest_key(batch_id), manifest.to_json())
         self._append_audit("quarantine", batch_id, manifest.entries)
         return manifest
@@ -200,13 +220,22 @@ class QuarantineManager:
         return [m for m in self.list_batches() if m.is_expired(self.now)]
 
     def purge(self, batches: list[Manifest]) -> int:
-        """Permanently delete the given quarantined batches. Returns bytes freed."""
+        """Permanently delete the given quarantined batches. Returns bytes freed.
+
+        Deletion goes through :func:`bulk_delete`, which uses the adapter's
+        bulk ``delete_many`` (S3 ``delete_objects``, 1000 keys/request) when
+        available and falls back to per-key deletes otherwise — the
+        difference between one request per 1000 objects and one per object
+        when purging at scale.
+        """
+        from cloudcleaner.bulk import bulk_delete
+
         freed = 0
         for manifest in batches:
-            for entry in manifest.entries:
-                self.adapter.delete(self.q_bucket, entry.quarantine_key)
-                freed += entry.size_bytes
-            self.adapter.delete(self.q_bucket, self._manifest_key(manifest.batch_id))
+            keys = [entry.quarantine_key for entry in manifest.entries]
+            keys.append(self._manifest_key(manifest.batch_id))
+            bulk_delete(self.adapter, self.q_bucket, keys)
+            freed += manifest.total_bytes
             self._append_audit("purge", manifest.batch_id, manifest.entries)
         return freed
 
