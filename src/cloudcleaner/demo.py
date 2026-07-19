@@ -9,11 +9,11 @@ from __future__ import annotations
 import random
 from datetime import datetime, timedelta, timezone
 
-from .adapters.memory import MemoryAdapter
-from .config import Config, QuarantineSettings, Rule
-from .models import StorageObject
-from .report import compute_savings, text_report
-from .rules import RuleEngine
+from cloudcleaner.adapters.memory import MemoryAdapter
+from cloudcleaner.config import Config, QuarantineSettings, Rule
+from cloudcleaner.models import StorageObject
+from cloudcleaner.report import compute_savings, text_report
+from cloudcleaner.rules import RuleEngine
 
 GIB = 1024**3
 
@@ -65,7 +65,7 @@ def run_demo() -> None:
 
     engine = RuleEngine(config, now=now)
     result = engine.scan(adapter.list_objects(config.bucket))
-    savings = compute_savings(result, config.pricing_overrides, config.currency)
+    savings = compute_savings(result, config.pricing)
 
     print("cloudcleaner demo — simulated bucket, no real data touched\n")
     print(text_report(result, savings, config.quarantine.retention_days, limit=10))

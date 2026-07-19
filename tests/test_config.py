@@ -84,8 +84,8 @@ pricing:
         assert config.rules[0].name == "logs"
         assert config.quarantine.prefix == "q/"  # trailing slash added
         assert config.quarantine.retention_days == 7
-        assert config.pricing_overrides == {"STANDARD": 0.024}
-        assert config.currency == "EUR"
+        assert config.pricing.overrides == {"STANDARD": 0.024}
+        assert config.pricing.currency == "EUR"
 
     def test_missing_bucket(self, tmp_path):
         path = tmp_path / "rules.yaml"

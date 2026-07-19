@@ -14,6 +14,8 @@ from pathlib import Path
 
 import yaml
 
+from cloudcleaner.pricing import PricingModel
+
 QUARANTINE_PREFIX_DEFAULT = "_cloudcleaner/quarantine/"
 RETENTION_DAYS_DEFAULT = 30
 
@@ -109,8 +111,7 @@ class Config:
     region: str | None = None
     endpoint_url: str | None = None
     quarantine: QuarantineSettings = field(default_factory=QuarantineSettings)
-    pricing_overrides: dict[str, float] = field(default_factory=dict)
-    currency: str = "USD"
+    pricing: PricingModel = field(default_factory=PricingModel)
 
 
 def load_config(path: str | Path) -> Config:
@@ -161,6 +162,5 @@ def load_config(path: str | Path) -> Config:
         region=raw.get("region"),
         endpoint_url=raw.get("endpoint_url"),
         quarantine=quarantine,
-        pricing_overrides=overrides,
-        currency=str(p_raw.get("currency", "USD")),
+        pricing=PricingModel(overrides=overrides, currency=str(p_raw.get("currency", "USD"))),
     )

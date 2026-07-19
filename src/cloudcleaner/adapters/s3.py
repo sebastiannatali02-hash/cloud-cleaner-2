@@ -11,7 +11,7 @@ from typing import Iterator
 
 import boto3
 
-from ..models import StorageObject
+from cloudcleaner.models import StorageObject
 
 
 class S3Adapter:

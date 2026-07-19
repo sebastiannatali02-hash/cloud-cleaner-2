@@ -12,9 +12,9 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from .adapters import StorageAdapter
-from .config import Config
-from .models import Candidate
+from cloudcleaner.adapters import StorageAdapter
+from cloudcleaner.config import Config
+from cloudcleaner.models import Candidate
 
 MANIFEST_NAME = "manifest.json"
 

@@ -11,7 +11,7 @@ the customer's region or negotiated rates.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 GIB = 1024**3
 
@@ -97,3 +97,25 @@ def estimate_savings(
         after_monthly=monthly_cost(remaining, overrides),
         currency=currency,
     )
+
+
+@dataclass(frozen=True)
+class PricingModel:
+    """A customer's cost model: currency plus per-class price overrides.
+
+    Bundles what used to travel as loose (overrides, currency) pairs so
+    callers depend on one cohesive object.
+    """
+
+    overrides: dict[str, float] = field(default_factory=dict)
+    currency: str = "USD"
+
+    def monthly_cost(self, bytes_by_class: dict[str, int]) -> float:
+        return monthly_cost(bytes_by_class, self.overrides)
+
+    def estimate_savings(
+        self, scanned_by_class: dict[str, int], candidates_by_class: dict[str, int]
+    ) -> Savings:
+        return estimate_savings(
+            scanned_by_class, candidates_by_class, self.overrides, self.currency
+        )

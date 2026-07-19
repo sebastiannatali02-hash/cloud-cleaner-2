@@ -118,6 +118,7 @@ pytest
 
 The core only speaks the `StorageAdapter` interface
 (`src/cloudcleaner/adapters/`); adding Azure Blob or GCS means
-implementing that interface and registering it in `get_adapter`. The
+implementing that interface and registering a factory with the
+`@register_adapter("name")` decorator — no existing code changes. The
 `memory` provider is a full in-process implementation used by the test
 suite and the demo.

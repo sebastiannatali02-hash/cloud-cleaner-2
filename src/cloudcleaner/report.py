@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import json
 
-from .models import ScanResult
-from .pricing import Savings, estimate_savings
+from cloudcleaner.models import ScanResult
+from cloudcleaner.pricing import PricingModel, Savings
 
 
 def human_size(size_bytes: int) -> str:
@@ -21,10 +21,8 @@ def human_size(size_bytes: int) -> str:
     return f"{size:.1f} TiB"
 
 
-def compute_savings(result: ScanResult, overrides: dict[str, float], currency: str) -> Savings:
-    return estimate_savings(
-        result.scanned_by_class, result.candidates_by_class, overrides, currency
-    )
+def compute_savings(result: ScanResult, pricing: PricingModel) -> Savings:
+    return pricing.estimate_savings(result.scanned_by_class, result.candidates_by_class)
 
 
 def text_report(result: ScanResult, savings: Savings, retention_days: int, limit: int = 20) -> str:

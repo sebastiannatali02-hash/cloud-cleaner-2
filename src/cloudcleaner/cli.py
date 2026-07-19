@@ -10,11 +10,11 @@ from __future__ import annotations
 import argparse
 import sys
 
-from .adapters import get_adapter
-from .config import Config, ConfigError, load_config
-from .quarantine import QuarantineManager
-from .report import compute_savings, human_size, json_report, text_report
-from .rules import RuleEngine
+from cloudcleaner.adapters import get_adapter
+from cloudcleaner.config import Config, ConfigError, load_config
+from cloudcleaner.quarantine import QuarantineManager
+from cloudcleaner.report import compute_savings, human_size, json_report, text_report
+from cloudcleaner.rules import RuleEngine
 
 
 def _load(args) -> Config:
@@ -33,7 +33,7 @@ def cmd_scan(args) -> int:
     config = _load(args)
     adapter = get_adapter(config)
     result = _scan(config, adapter)
-    savings = compute_savings(result, config.pricing_overrides, config.currency)
+    savings = compute_savings(result, config.pricing)
     output = (
         json_report(result, savings)
         if args.json
@@ -57,7 +57,7 @@ def cmd_quarantine(args) -> int:
         return 0
 
     if not args.apply:
-        savings = compute_savings(result, config.pricing_overrides, config.currency)
+        savings = compute_savings(result, config.pricing)
         print(text_report(result, savings, config.quarantine.retention_days, limit=args.limit))
         print("\nDry run: no changes made. Re-run with --apply to quarantine these objects.")
         return 0
@@ -126,7 +126,7 @@ def cmd_restore(args) -> int:
 
 
 def cmd_demo(args) -> int:
-    from .demo import run_demo
+    from cloudcleaner.demo import run_demo
 
     run_demo()
     return 0
