@@ -103,6 +103,10 @@ class DistributedLock:
         except KeyError:
             return None
 
+    def current_holder(self) -> LockInfo | None:
+        """The lock's current holder (or None if free) — for error messages."""
+        return self._read()
+
     def acquire(self) -> bool:
         """Try to take the lock. Returns True on success, False if another
         live (non-expired) holder has it. Takes over an expired lock."""

@@ -8,10 +8,14 @@ deletion happens through ``purge`` after the retention window.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
+import socket
 import sys
 
 from cloudcleaner.adapters import get_adapter
 from cloudcleaner.config import Config, ConfigError, load_config
+from cloudcleaner.lock import DistributedLock, LockError
 from cloudcleaner.quarantine import ManifestIntegrityError, QuarantineManager
 from cloudcleaner.report import (
     compute_savings,
@@ -34,6 +38,36 @@ def _load(args) -> Config:
 def _scan(config: Config, adapter, now=None):
     engine = RuleEngine(config, now=now)
     return engine.scan(adapter.list_objects(config.bucket, prefix=config.prefix))
+
+
+@contextlib.contextmanager
+def _bucket_lock(config: Config, adapter, args):
+    """Hold the distributed bucket lock around a mutating operation so
+    concurrent CLI runs / a second host / the UI can't race the bucket.
+
+    Acquired around the scan+mutate span (not just the write) so two callers
+    can't both select the same candidates. ``--no-lock`` skips it (escape hatch
+    for backends without conditional-write support); a busy bucket raises
+    LockError, surfaced by ``main`` as a clear non-zero exit.
+
+    The lock object lives inside the quarantine prefix so the rule engine and
+    dedup — which exclude that prefix — never treat it as a cleanup candidate.
+    """
+    if getattr(args, "no_lock", False):
+        yield
+        return
+    owner = f"{socket.gethostname()}/pid-{os.getpid()}"
+    lock = DistributedLock(
+        adapter, config.bucket, owner=owner, key=config.quarantine.prefix + "LOCK"
+    )
+    if not lock.acquire():
+        holder = lock.current_holder()
+        who = holder.owner if holder else "another process"
+        raise LockError(f"bucket {config.bucket!r} is locked by {who}")
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def cmd_scan(args) -> int:
@@ -71,34 +105,43 @@ def cmd_scan(args) -> int:
 def cmd_quarantine(args) -> int:
     config = _load(args)
     adapter = get_adapter(config)
-    result = _scan(config, adapter)
-    if not result.candidates:
-        print("No objects matched the cleanup rules; nothing to quarantine.")
-        return 0
 
+    # Dry run is read-only — no lock needed.
     if not args.apply:
+        result = _scan(config, adapter)
+        if not result.candidates:
+            print("No objects matched the cleanup rules; nothing to quarantine.")
+            return 0
         savings = compute_savings(result, config.pricing)
         print(text_report(result, savings, config.quarantine.retention_days, limit=args.limit))
         print("\nDry run: no changes made. Re-run with --apply to quarantine these objects.")
         return 0
 
-    # Blast-radius guardrail: refuse an --apply that would quarantine an
-    # unexpectedly large share of the bucket, unless --force overrides.
-    if not args.force:
-        from cloudcleaner.guardrail import (
-            GuardrailLimits,
-            GuardrailViolation,
-            check_guardrail,
-        )
+    # --apply mutates: hold the bucket lock across scan+guardrail+move so two
+    # callers can't both select and move the same candidates.
+    with _bucket_lock(config, adapter, args):
+        result = _scan(config, adapter)
+        if not result.candidates:
+            print("No objects matched the cleanup rules; nothing to quarantine.")
+            return 0
 
-        try:
-            check_guardrail(result, GuardrailLimits.from_dict(config.quarantine.guardrail))
-        except GuardrailViolation as exc:
-            print(f"guardrail: {exc}", file=sys.stderr)
-            return 1
+        # Blast-radius guardrail: refuse an --apply that would quarantine an
+        # unexpectedly large share of the bucket, unless --force overrides.
+        if not args.force:
+            from cloudcleaner.guardrail import (
+                GuardrailLimits,
+                GuardrailViolation,
+                check_guardrail,
+            )
 
-    manager = QuarantineManager(adapter, config)
-    manifest = manager.quarantine(result.candidates)
+            try:
+                check_guardrail(result, GuardrailLimits.from_dict(config.quarantine.guardrail))
+            except GuardrailViolation as exc:
+                print(f"guardrail: {exc}", file=sys.stderr)
+                return 1
+
+        manager = QuarantineManager(adapter, config)
+        manifest = manager.quarantine(result.candidates)
     print(
         f"Quarantined {len(manifest.entries)} objects "
         f"({human_size(manifest.total_bytes)}) as batch {manifest.batch_id}."
@@ -123,7 +166,8 @@ def cmd_batches(args) -> int:
 
 def cmd_purge(args) -> int:
     config = _load(args)
-    manager = QuarantineManager(get_adapter(config), config)
+    adapter = get_adapter(config)
+    manager = QuarantineManager(adapter, config)
     batches = manager.list_batches() if args.force else manager.expired_batches()
     if args.batch:
         batches = [m for m in batches if m.batch_id == args.batch]
@@ -163,16 +207,21 @@ def cmd_purge(args) -> int:
             print("Aborted; nothing was deleted.")
             return 1
 
-    freed = manager.purge(batches)
+    # Hold the lock across the delete so a concurrent restore can't move a
+    # batch back between confirmation and permanent deletion.
+    with _bucket_lock(config, adapter, args):
+        freed = manager.purge(batches)
     print(f"Permanently deleted {human_size(freed)} across {len(batches)} batch(es).")
     return 0
 
 
 def cmd_restore(args) -> int:
     config = _load(args)
-    manager = QuarantineManager(get_adapter(config), config)
+    adapter = get_adapter(config)
+    manager = QuarantineManager(adapter, config)
     try:
-        restored = manager.restore(args.batch, keys=args.key or None)
+        with _bucket_lock(config, adapter, args):
+            restored = manager.restore(args.batch, keys=args.key or None)
     except KeyError as exc:
         print(f"error: {exc.args[0]}", file=sys.stderr)
         return 1
@@ -243,7 +292,8 @@ def cmd_multipart(args) -> int:
         )
         return 0
 
-    count, reclaimed = abort_uploads(adapter, config.bucket, uploads)
+    with _bucket_lock(config, adapter, args):
+        count, reclaimed = abort_uploads(adapter, config.bucket, uploads)
     print(f"Aborted {count} incomplete upload(s), reclaimed ~{human_size(reclaimed)}.")
     return 0
 
@@ -269,6 +319,16 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--config", "-c", required=True, help="path to the YAML config")
         if bucket:
             p.add_argument("--bucket", help="override the bucket from the config")
+
+    def add_lock_opt(p):
+        # Mutating commands take the distributed bucket lock by default so
+        # concurrent runs / a second host / the UI can't race.
+        p.add_argument(
+            "--no-lock",
+            dest="no_lock",
+            action="store_true",
+            help="skip the distributed bucket lock (unsafe if others may run concurrently)",
+        )
 
     p = sub.add_parser("scan", help="dry-run: list candidates and estimated savings")
     add_common(p)
@@ -298,6 +358,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="override the blast-radius guardrail (quarantine even a large share of the bucket)",
     )
+    add_lock_opt(p)
     p.set_defaults(func=cmd_quarantine)
 
     p = sub.add_parser("batches", help="list quarantine batches and their expiry")
@@ -315,12 +376,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip the interactive confirmation prompt before permanent deletion",
     )
+    add_lock_opt(p)
     p.set_defaults(func=cmd_purge)
 
     p = sub.add_parser("restore", help="bring quarantined objects back to their original keys")
     add_common(p)
     p.add_argument("--batch", required=True, help="quarantine batch id to restore from")
     p.add_argument("--key", action="append", help="restore only this original key (repeatable)")
+    add_lock_opt(p)
     p.set_defaults(func=cmd_restore)
 
     p = sub.add_parser("dedup", help="find exact-duplicate objects (by ETag + size)")
@@ -350,6 +413,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--apply", action="store_true", help="actually abort uploads (default: dry run)"
     )
+    add_lock_opt(p)
     p.set_defaults(func=cmd_multipart)
 
     p = sub.add_parser("demo", help="run an offline demo on a simulated bucket")
@@ -367,6 +431,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except ManifestIntegrityError as exc:
         print(f"integrity error: {exc}", file=sys.stderr)
+        return 1
+    except LockError as exc:
+        print(f"locked: {exc} (another operation is in progress; retry later or "
+              f"pass --no-lock if you are certain no one else is running)", file=sys.stderr)
         return 1
     except FileNotFoundError as exc:
         print(f"error: {exc}", file=sys.stderr)
