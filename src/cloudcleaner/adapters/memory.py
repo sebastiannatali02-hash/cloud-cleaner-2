@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from threading import Lock
 from typing import Iterable, Iterator
 
 from cloudcleaner.models import StorageObject
@@ -13,6 +14,8 @@ class MemoryAdapter:
         self.buckets: dict[str, dict[str, tuple[StorageObject, str | None]]] = {}
         # bucket -> list of multipart upload records (plain dicts)
         self.multipart: dict[str, list[dict]] = {}
+        # guards put_if_absent so its check-and-create is atomic under threads
+        self._lock = Lock()
 
     def seed(self, bucket: str, objects: list[StorageObject]) -> None:
         store = self.buckets.setdefault(bucket, {})
@@ -51,6 +54,16 @@ class MemoryAdapter:
             last_modified=datetime.now(timezone.utc),
         )
         self.buckets.setdefault(bucket, {})[key] = (obj, text)
+
+    def put_if_absent(self, bucket: str, key: str, text: str) -> bool:
+        """Atomically create ``key`` only if absent; True if created. Mirrors
+        the S3 conditional-write semantics for tests and the memory backend."""
+        with self._lock:
+            store = self.buckets.setdefault(bucket, {})
+            if key in store:
+                return False
+            self.put_text(bucket, key, text)
+            return True
 
     def get_text(self, bucket: str, key: str) -> str:
         text = self.buckets[bucket][key][1]

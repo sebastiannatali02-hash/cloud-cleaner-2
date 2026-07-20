@@ -355,30 +355,57 @@ def get_state() -> dict:
 # ---- single-flight bucket gate ---------------------------------------------
 # Every mutating action (run / reset / reset_large) touches the one shared
 # bucket. Concurrent mutations race (interleaved manifest writes, half-restored
-# batches), so only ONE may be in flight at a time. This gate is authoritative
-# regardless of how the action was triggered (UI or direct API call).
+# batches), so only ONE may be in flight at a time.
+#
+# Two layers:
+#   1. An in-process flag (_BUSY) — a fast local pre-check so this server
+#      rejects overlaps instantly without an S3 round-trip.
+#   2. A DistributedLock in the bucket — AUTHORITATIVE across processes/hosts,
+#      so a second server, a CLI run, or a cron job cannot race us either.
+import os  # noqa: E402
+import socket  # noqa: E402
+
+from cloudcleaner.lock import DistributedLock  # noqa: E402
+
 _BUSY_LOCK = Lock()
 _BUSY = {"active": None}  # label of the in-flight mutating action, or None
+_DIST = {"lock": None}    # the currently held DistributedLock, if any
+_OWNER = f"{socket.gethostname()}/pid-{os.getpid()}"
 
 
-def try_begin(label: str) -> bool:
-    """Claim the bucket for a mutating action. Returns False if one is already
-    running (caller should reject)."""
+def try_begin(label: str) -> tuple[bool, str]:
+    """Claim the bucket for a mutating action across both layers. Returns
+    (ok, reason). On failure, reason explains who holds it."""
     with _BUSY_LOCK:
         if _BUSY["active"] is not None:
-            return False
+            return False, f"'{_BUSY['active']}' is already running (this server)"
+        # Take the in-process flag first so we don't leave a distributed lock
+        # dangling if two local threads race here.
         _BUSY["active"] = label
-        return True
+    # Keep the lock object INSIDE the quarantine prefix so the rule engine /
+    # dedup (which exclude that prefix) never treat it as a cleanup candidate.
+    dl = DistributedLock(
+        _adapter(), BUCKET, owner=f"{_OWNER}:{label}", key=QUARANTINE_PREFIX + "LOCK"
+    )
+    if not dl.acquire():
+        held = dl._read()
+        who = held.owner if held else "another process"
+        with _BUSY_LOCK:
+            _BUSY["active"] = None
+        return False, f"bucket is locked by {who}"
+    _DIST["lock"] = dl
+    return True, ""
 
 
 def end() -> None:
+    dl = _DIST.get("lock")
+    if dl is not None:
+        try:
+            dl.release()
+        finally:
+            _DIST["lock"] = None
     with _BUSY_LOCK:
         _BUSY["active"] = None
-
-
-def busy_label():
-    with _BUSY_LOCK:
-        return _BUSY["active"]
 
 
 # ---- live progress ---------------------------------------------------------
@@ -548,10 +575,11 @@ def action_run(payload: dict) -> dict:
     selected = [name for name in RUN_ORDER if steps.get(name, {}).get("enabled")]
     if not selected:
         return {"error": "No cleans selected — tick at least one."}
-    # Single-flight: claim the bucket before starting. Rejects if any mutating
-    # action (another run, or a reset) is in flight.
-    if not try_begin("run"):
-        return {"error": f"Busy: '{busy_label()}' is already running against the bucket."}
+    # Single-flight: claim the bucket (local flag + distributed lock) before
+    # starting. Rejects if any mutating action is in flight here or elsewhere.
+    ok, reason = try_begin("run")
+    if not ok:
+        return {"error": f"Busy: {reason}."}
     _progress_reset(("Applying" if apply else "Previewing") + f" {len(selected)} clean(s)…")
     Thread(target=_run_worker, args=(apply, steps, selected), daemon=True).start()
     return {"started": True, "selected": selected}
@@ -559,8 +587,9 @@ def action_run(payload: dict) -> dict:
 
 def _guarded_seed(label: str, fn, message: str) -> dict:
     """Run a synchronous bucket-mutating seed under the single-flight gate."""
-    if not try_begin(label):
-        return {"error": f"Busy: '{busy_label()}' is already running against the bucket."}
+    ok, reason = try_begin(label)
+    if not ok:
+        return {"error": f"Busy: {reason}."}
     try:
         return {"message": message, "state": fn()}
     finally:

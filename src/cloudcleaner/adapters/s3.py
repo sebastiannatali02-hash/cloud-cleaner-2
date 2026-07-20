@@ -57,6 +57,28 @@ class S3Adapter:
     def put_text(self, bucket: str, key: str, text: str) -> None:
         self._client.put_object(Bucket=bucket, Key=key, Body=text.encode("utf-8"))
 
+    def put_if_absent(self, bucket: str, key: str, text: str) -> bool:
+        """Atomically create ``key`` only if it does not already exist.
+
+        Uses S3 conditional writes (``If-None-Match: *``); returns True when
+        this call created the object and False when it already existed. This
+        is the atomicity primitive behind the distributed lock — S3 guarantees
+        exactly one concurrent caller wins the create.
+        """
+        from botocore.exceptions import ClientError
+
+        try:
+            self._client.put_object(
+                Bucket=bucket, Key=key, Body=text.encode("utf-8"), IfNoneMatch="*"
+            )
+            return True
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if code in ("PreconditionFailed", "ConditionalRequestConflict") or status == 412:
+                return False
+            raise
+
     def get_text(self, bucket: str, key: str) -> str:
         """Read an object's text body.
 
