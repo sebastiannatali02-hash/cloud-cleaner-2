@@ -58,12 +58,28 @@
   .legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 10px 4px 0; font-size: 12px; color: var(--text-secondary); }
   .legend .k { display: inline-flex; align-items: center; gap: 6px; }
 
-  /* actions */
-  .actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap: 12px; }
-  .card { background: var(--surface-1); border: 1px solid var(--grid); border-radius: var(--radius); padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
-  .card .title { font-weight: 600; }
-  .card .desc { color: var(--text-secondary); font-size: 12px; flex: 1; }
-  .card .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  /* cleanup runner */
+  .runner { background: var(--surface-1); border: 1px solid var(--grid); border-radius: var(--radius); overflow: hidden; }
+  .steps { }
+  .step { display: grid; grid-template-columns: 26px 1fr auto; gap: 12px; align-items: start; padding: 14px 18px; border-bottom: 1px solid var(--grid); }
+  .step.on { background: #f7fbff; }
+  .step .tick { margin-top: 2px; }
+  .step .tick input { width: 17px; height: 17px; cursor: pointer; }
+  .step .body .name { font-weight: 600; }
+  .step .body .desc { color: var(--text-secondary); font-size: 12px; margin-top: 2px; }
+  .step .cfg { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: flex-end; min-width: 180px; }
+  .step .cfg.disabled { opacity: .4; pointer-events: none; }
+  .step .cfg label { font-size: 12px; color: var(--text-secondary); display: inline-flex; align-items: center; gap: 5px; }
+  .step .cfg select, .step .cfg input[type=text] { font: inherit; font-size: 12px; padding: 3px 6px; border: 1px solid var(--grid); border-radius: 6px; background: var(--surface-1); }
+  .step .cfg input[type=text] { width: 80px; }
+  .runbar { display: flex; align-items: center; gap: 10px; padding: 14px 18px; background: var(--surface-2); flex-wrap: wrap; }
+  .runbar .mode { display: flex; gap: 16px; }
+  .runbar .spacer { flex: 1; }
+  .run-result { padding: 0 18px; }
+  .run-result.show { padding: 14px 18px; border-top: 1px solid var(--grid); }
+  .run-result .line { font-size: 13px; padding: 3px 0; display: flex; gap: 8px; align-items: baseline; }
+  .run-result .line::before { content: "›"; color: var(--muted); }
+  .run-result .line.err { color: var(--critical); }
   button {
     font: inherit; border: 1px solid var(--grid); background: var(--surface-2);
     color: var(--text-primary); border-radius: 7px; padding: 7px 12px; cursor: pointer;
@@ -71,6 +87,7 @@
   button:hover { border-color: var(--muted); }
   button.primary { background: var(--live); border-color: var(--live); color: #fff; }
   button.danger { background: var(--critical); border-color: var(--critical); color: #fff; }
+  button.ghost { background: transparent; font-size: 12px; padding: 6px 10px; }
   button:disabled { opacity: .5; cursor: default; }
   label.chk { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-secondary); }
 
@@ -125,8 +142,21 @@
   </section>
 
   <section>
-    <h2>Operations</h2>
-    <div class="actions" id="actions"></div>
+    <h2>Build a cleanup run</h2>
+    <div class="runner" id="runner">
+      <div class="steps" id="stepList"></div>
+      <div class="runbar">
+        <div class="mode">
+          <label class="chk"><input type="radio" name="mode" value="dry" checked> Dry run (preview only)</label>
+          <label class="chk"><input type="radio" name="mode" value="apply"> Apply (make changes)</label>
+        </div>
+        <span class="spacer"></span>
+        <button id="selectAll" class="ghost">Select all</button>
+        <button id="clearAll" class="ghost">Clear</button>
+        <button id="runBtn" class="primary">▶ Run selected cleans</button>
+      </div>
+      <div class="run-result" id="runResult"></div>
+    </div>
   </section>
 
   <section>
@@ -227,40 +257,81 @@ function renderBatches(s){
     </div>`).join("");
 }
 
-const OPS = [
-  {name:"scan", title:"Scan", desc:"Read-only: evaluate rules and estimate savings. Never mutates.", toggles:[]},
-  {name:"quarantine", title:"Quarantine", desc:"Move candidates to the quarantine prefix (restorable).", toggles:["apply","force"]},
-  {name:"dedup", title:"Deduplicate", desc:"Delete redundant exact-duplicate copies, keeping one per group.", toggles:["apply"]},
-  {name:"multipart", title:"Abort multipart", desc:"Abort incomplete multipart uploads (orphaned parts).", toggles:["apply"]},
-  {name:"purge", title:"Purge", desc:"Permanently delete quarantined batches (force = ignore retention).", toggles:["apply","force"], danger:true},
-  {name:"restore", title:"Restore all", desc:"Return every quarantined object to its original key.", toggles:[]},
+// Each clean is a selectable step with optional inline config. Order here is
+// display order; the server runs them in a fixed safe order regardless.
+const STEPS = [
+  {name:"dedup", title:"Deduplicate", desc:"Delete redundant exact-duplicate copies, keeping one per group. Skips legal-hold & quarantine.",
+   cfg:[{flag:"keep", type:"select", label:"keep", opts:["oldest","newest"]},
+        {flag:"min_size", type:"text", label:"min bytes", placeholder:"0"}]},
+  {name:"multipart", title:"Abort incomplete uploads", desc:"Abort orphaned multipart uploads that AWS still bills for.",
+   cfg:[{flag:"older_than", type:"text", label:"older than", placeholder:"e.g. 7d"}]},
+  {name:"quarantine", title:"Quarantine stale objects", desc:"Move rule-matched candidates to the quarantine prefix (restorable).",
+   cfg:[{flag:"force", type:"check", label:"override guardrail"}]},
+  {name:"purge", title:"Purge quarantine", desc:"Permanently delete quarantined batches past their retention window.",
+   cfg:[{flag:"force", type:"check", label:"ignore retention"}], danger:true},
+  {name:"restore", title:"Restore quarantine", desc:"Return every quarantined object to its original key.", cfg:[]},
 ];
 
-function renderActions(){
-  $("actions").innerHTML = OPS.map(op=>`
-    <div class="card" id="card-${op.name}">
-      <div class="title">${op.title}</div>
-      <div class="desc">${op.desc}</div>
-      <div class="controls">
-        ${op.toggles.map(t=>`<label class="chk"><input type="checkbox" data-op="${op.name}" data-flag="${t}"> ${t}</label>`).join("")}
-        <button class="${op.danger?'danger':'primary'}" data-run="${op.name}">Run</button>
+function renderSteps(){
+  $("stepList").innerHTML = STEPS.map(s=>`
+    <div class="step" id="step-${s.name}">
+      <div class="tick"><input type="checkbox" data-step="${s.name}"></div>
+      <div class="body"><div class="name">${s.title}</div><div class="desc">${s.desc}</div></div>
+      <div class="cfg disabled" id="cfg-${s.name}">
+        ${s.cfg.map(c=>{
+          if (c.type==="select") return `<label>${c.label} <select data-cfg="${s.name}" data-flag="${c.flag}">${c.opts.map(o=>`<option>${o}</option>`).join("")}</select></label>`;
+          if (c.type==="text") return `<label>${c.label} <input type="text" data-cfg="${s.name}" data-flag="${c.flag}" placeholder="${c.placeholder||""}"></label>`;
+          if (c.type==="check") return `<label><input type="checkbox" data-cfg="${s.name}" data-flag="${c.flag}"> ${c.label}</label>`;
+          return "";
+        }).join("")}
       </div>
     </div>`).join("");
-  document.querySelectorAll("[data-run]").forEach(b=>b.onclick=()=>runAction(b.dataset.run));
+  document.querySelectorAll("[data-step]").forEach(cb=>cb.onchange=()=>{
+    const row=$("step-"+cb.dataset.step), cfg=$("cfg-"+cb.dataset.step);
+    row.classList.toggle("on", cb.checked);
+    cfg.classList.toggle("disabled", !cb.checked);
+  });
+  $("selectAll").onclick=()=>toggleAll(true);
+  $("clearAll").onclick=()=>toggleAll(false);
+  $("runBtn").onclick=runSelected;
 }
 
-async function runAction(name){
-  const payload = {};
-  document.querySelectorAll(`[data-op="${name}"]`).forEach(cb=>{ if(cb.checked) payload[cb.dataset.flag]=true; });
-  const card = $("card-"+name); if (card) card.classList.add("spin");
+function toggleAll(on){
+  document.querySelectorAll("[data-step]").forEach(cb=>{ cb.checked=on; cb.onchange(); });
+}
+
+function collectRun(){
+  const apply = document.querySelector('input[name="mode"]:checked').value==="apply";
+  const steps = {};
+  STEPS.forEach(s=>{
+    const cb=document.querySelector(`[data-step="${s.name}"]`);
+    const step={enabled:cb.checked};
+    document.querySelectorAll(`[data-cfg="${s.name}"]`).forEach(el=>{
+      step[el.dataset.flag] = el.type==="checkbox" ? el.checked : el.value;
+    });
+    steps[s.name]=step;
+  });
+  return {apply, steps};
+}
+
+async function runSelected(){
+  const payload = collectRun();
+  const selected = Object.entries(payload.steps).filter(([,v])=>v.enabled).map(([k])=>k);
+  if (!selected.length){ banner("Tick at least one clean to run.","err"); return; }
+  if (payload.apply && !confirm(`Apply ${selected.length} clean(s) to the bucket? This makes real changes.`)) return;
+  $("runBtn").classList.add("spin"); $("runResult").className="run-result";
   try {
-    const res = await fetch("/api/action/"+name, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
+    const res = await fetch("/api/action/run", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
     const data = await res.json();
-    if (data.error){ banner(data.error,"err"); logLine(`${name}: ${data.error}`,"err"); }
-    else { banner(data.message,"ok"); logLine(`${name}: ${data.message}`,"ok"); }
+    banner(data.message + (data.error?` (${data.error})`:""), data.error?"err":"ok");
+    logLine(data.message+" "+(data.steps_result||[]).join(" | "), data.error?"err":"ok");
+    const rr=$("runResult");
+    rr.className="run-result show";
+    rr.innerHTML=`<div class="line"><b>${data.message}</b></div>`+
+      (data.steps_result||[]).map(m=>`<div class="line ${/error|guardrail/.test(m)?'err':''}">${m}</div>`).join("");
     if (data.state) render(data.state);
-  } catch(e){ banner("request failed: "+e,"err"); logLine(`${name}: ${e}`,"err"); }
-  finally { if (card) card.classList.remove("spin"); }
+  } catch(e){ banner("run failed: "+e,"err"); }
+  finally { $("runBtn").classList.remove("spin"); }
 }
 
 async function resetBucket(){
@@ -291,7 +362,7 @@ function render(s){
 
 $("refreshBtn").onclick = refresh;
 $("resetBtn").onclick = resetBucket;
-renderActions();
+renderSteps();
 refresh();
 </script>
 </body>

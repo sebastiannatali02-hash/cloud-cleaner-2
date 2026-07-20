@@ -249,101 +249,128 @@ def get_state() -> dict:
     }
 
 
-# ---- actions ---------------------------------------------------------------
-def action_quarantine(apply: bool, force: bool) -> dict:
+# ---- clean steps -----------------------------------------------------------
+# Each step is `fn(apply, opts) -> (message, is_error)` — it does the work but
+# does NOT compute state; the endpoint attaches state once. This lets several
+# steps compose into a single run without recomputing state per step.
+def step_dedup(apply: bool, opts: dict) -> tuple[str, bool]:
+    adapter = _adapter()
+    config = _config()
+    keep = opts.get("keep", "oldest")
+    groups = find_duplicates(_dedupable(adapter, config), min_size=int(opts.get("min_size", 0) or 0))
+    if not groups:
+        return "dedup: no exact duplicates found.", False
+    redundant = [m.key for g in groups for m in choose_redundant(g, keep=keep)]
+    if not apply:
+        return f"dedup: would remove {len(redundant)} redundant copy(ies) (keep {keep}).", False
+    from cloudcleaner.bulk import bulk_delete
+
+    bulk_delete(adapter, BUCKET, redundant)
+    return f"dedup: deleted {len(redundant)} redundant duplicate copy(ies).", False
+
+
+def step_multipart(apply: bool, opts: dict) -> tuple[str, bool]:
+    adapter = _adapter()
+    older = opts.get("older_than") or None
+    uploads = find_incomplete_uploads(adapter, BUCKET, older_than=older)
+    if not uploads:
+        return "multipart: no incomplete uploads matched.", False
+    if not apply:
+        return f"multipart: would abort {len(uploads)} incomplete upload(s).", False
+    count, reclaimed = abort_uploads(adapter, BUCKET, uploads)
+    return f"multipart: aborted {count} upload(s), reclaimed ~{reclaimed} bytes.", False
+
+
+def step_quarantine(apply: bool, opts: dict) -> tuple[str, bool]:
     adapter = _adapter()
     config = _config()
     engine = RuleEngine(config)
     result = engine.scan(adapter.list_objects(BUCKET))
     if not result.candidates:
-        return {"message": "No candidates matched the rules.", "state": get_state()}
+        return "quarantine: no candidates matched the rules.", False
     if not apply:
-        return {
-            "message": f"Dry run: {result.candidate_count} object(s) would be quarantined.",
-            "state": get_state(),
-        }
-    # guardrail
+        return f"quarantine: would quarantine {result.candidate_count} object(s).", False
     from cloudcleaner.guardrail import GuardrailLimits, GuardrailViolation, check_guardrail
 
-    if not force:
+    if not opts.get("force"):
         try:
             check_guardrail(result, GuardrailLimits.from_dict(config.quarantine.guardrail))
         except GuardrailViolation as exc:
-            return {"error": f"guardrail: {exc}", "state": get_state()}
+            return f"quarantine: guardrail: {exc}", True
     manager = QuarantineManager(adapter, config)
     manifest = manager.quarantine(result.candidates)
-    return {
-        "message": f"Quarantined {len(manifest.entries)} object(s) as batch {manifest.batch_id}.",
-        "state": get_state(),
-    }
+    return f"quarantine: moved {len(manifest.entries)} object(s) as batch {manifest.batch_id}.", False
 
 
-def action_purge(apply: bool, force: bool) -> dict:
+def step_purge(apply: bool, opts: dict) -> tuple[str, bool]:
     adapter = _adapter()
     config = _config()
     manager = QuarantineManager(adapter, config)
-    batches = manager.list_batches() if force else manager.expired_batches()
+    batches = manager.list_batches() if opts.get("force") else manager.expired_batches()
     if not batches:
-        return {"message": "No purgeable batches (retention window still open; use force).",
-                "state": get_state()}
+        return "purge: no purgeable batches (retention still open; tick force to override).", False
     if not apply:
         n = sum(len(m.entries) for m in batches)
-        return {"message": f"Dry run: would permanently delete {n} object(s).", "state": get_state()}
+        return f"purge: would permanently delete {n} object(s).", False
     freed = manager.purge(batches)
-    return {"message": f"Permanently deleted {freed} bytes across {len(batches)} batch(es).",
-            "state": get_state()}
+    return f"purge: permanently deleted {freed} bytes across {len(batches)} batch(es).", False
 
 
-def action_restore() -> dict:
+def step_restore(apply: bool, opts: dict) -> tuple[str, bool]:
     adapter = _adapter()
     config = _config()
     manager = QuarantineManager(adapter, config)
     batches = manager.list_batches()
     if not batches:
-        return {"message": "No quarantine batches to restore.", "state": get_state()}
-    total = 0
-    for m in batches:
-        total += len(manager.restore(m.batch_id))
-    return {"message": f"Restored {total} object(s) to their original keys.", "state": get_state()}
-
-
-def action_dedup(apply: bool) -> dict:
-    adapter = _adapter()
-    config = _config()
-    groups = find_duplicates(_dedupable(adapter, config))
-    if not groups:
-        return {"message": "No exact duplicates found.", "state": get_state()}
-    redundant = [m.key for g in groups for m in choose_redundant(g, keep="oldest")]
+        return "restore: no quarantine batches to restore.", False
     if not apply:
-        return {"message": f"Dry run: {len(redundant)} redundant copy(ies) could be removed.",
-                "state": get_state()}
-    from cloudcleaner.bulk import bulk_delete
-
-    bulk_delete(adapter, BUCKET, redundant)
-    return {"message": f"Deleted {len(redundant)} redundant duplicate copy(ies).",
-            "state": get_state()}
+        n = sum(len(m.entries) for m in batches)
+        return f"restore: would restore {n} object(s) to original keys.", False
+    total = sum(len(manager.restore(m.batch_id)) for m in batches)
+    return f"restore: returned {total} object(s) to their original keys.", False
 
 
-def action_multipart(apply: bool) -> dict:
-    adapter = _adapter()
-    uploads = find_incomplete_uploads(adapter, BUCKET)
-    if not uploads:
-        return {"message": "No incomplete multipart uploads.", "state": get_state()}
-    if not apply:
-        return {"message": f"Dry run: would abort {len(uploads)} incomplete upload(s).",
-                "state": get_state()}
-    count, reclaimed = abort_uploads(adapter, BUCKET, uploads)
-    return {"message": f"Aborted {count} incomplete upload(s), reclaimed ~{reclaimed} bytes.",
-            "state": get_state()}
+STEPS = {
+    "dedup": step_dedup,
+    "multipart": step_multipart,
+    "quarantine": step_quarantine,
+    "purge": step_purge,
+    "restore": step_restore,
+}
+# Safe execution order regardless of tick order: reclaim/quarantine first,
+# purge last, restore only when explicitly chosen (mutually exclusive-ish).
+RUN_ORDER = ["dedup", "multipart", "quarantine", "purge", "restore"]
+
+
+def action_run(payload: dict) -> dict:
+    """Run a composed cleanup: the ticked steps, each with its own options,
+    under one master apply/force switch (per-step force may also be set)."""
+    apply = bool(payload.get("apply", False))
+    steps = payload.get("steps", {}) or {}
+    selected = [name for name in RUN_ORDER if steps.get(name, {}).get("enabled")]
+    if not selected:
+        return {"error": "No cleans selected — tick at least one.", "state": get_state()}
+    messages, had_error = [], False
+    for name in selected:
+        opts = dict(steps.get(name, {}))
+        try:
+            msg, is_err = STEPS[name](apply, opts)
+        except Exception as exc:  # noqa: BLE001
+            msg, is_err = f"{name}: error: {exc}", True
+        messages.append(msg)
+        had_error = had_error or is_err
+    header = ("Applied" if apply else "Dry run —") + f" {len(selected)} clean(s):"
+    return {
+        "message": header,
+        "steps_result": messages,
+        "error": ("one or more steps reported a problem" if had_error else None),
+        "state": get_state(),
+    }
 
 
 ACTIONS = {
     "scan": lambda p: {"message": "Scan complete.", "state": get_state()},
-    "quarantine": lambda p: action_quarantine(p.get("apply", False), p.get("force", False)),
-    "purge": lambda p: action_purge(p.get("apply", False), p.get("force", False)),
-    "restore": lambda p: action_restore(),
-    "dedup": lambda p: action_dedup(p.get("apply", False)),
-    "multipart": lambda p: action_multipart(p.get("apply", False)),
+    "run": action_run,
     "reset": lambda p: {"message": "Bucket reset and repopulated.", "state": seed_bucket()},
 }
 
