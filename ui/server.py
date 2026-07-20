@@ -142,6 +142,108 @@ def seed_bucket() -> dict:
     return get_state()
 
 
+# ---- large (multi-GB) seed for a visible-savings demo ----------------------
+MiB = 1024 * 1024
+SCRATCH = "_scratch/"
+
+
+def _wipe(c):
+    paginator = c.get_paginator("list_objects_v2")
+    to_delete = []
+    for page in paginator.paginate(Bucket=BUCKET):
+        for item in page.get("Contents", []):
+            to_delete.append({"Key": item["Key"]})
+    for i in range(0, len(to_delete), 1000):
+        c.delete_objects(Bucket=BUCKET, Delete={"Objects": to_delete[i : i + 1000]})
+    for u in c.list_multipart_uploads(Bucket=BUCKET).get("Uploads", []):
+        c.abort_multipart_upload(Bucket=BUCKET, Key=u["Key"], UploadId=u["UploadId"])
+
+
+def _assemble(c, key, source_key, times):
+    """Build `key` server-side by concatenating `times` copies of `source_key`
+    via UploadPartCopy — no bandwidth, same-region copy is free. Part copies
+    are independent, so run them concurrently (each 1 GiB copy is slow)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    uid = c.create_multipart_upload(Bucket=BUCKET, Key=key)["UploadId"]
+
+    def copy_part(i):
+        r = c.upload_part_copy(
+            Bucket=BUCKET, Key=key, PartNumber=i, UploadId=uid,
+            CopySource={"Bucket": BUCKET, "Key": source_key},
+        )
+        return {"ETag": r["CopyPartResult"]["ETag"], "PartNumber": i}
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        parts = sorted(pool.map(copy_part, range(1, times + 1)), key=lambda p: p["PartNumber"])
+    c.complete_multipart_upload(
+        Bucket=BUCKET, Key=key, UploadId=uid, MultipartUpload={"Parts": parts}
+    )
+
+
+def seed_large() -> dict:
+    """Wipe and seed a bucket with real multi-GB objects so dollar savings are
+    visibly non-zero. Builds volume server-side from a 16 MiB seed via a size
+    ladder (16 MiB -> 256 MiB -> 1 GiB), then assembles the big objects.
+
+    Candidates total ~60 GiB (~$1.38/mo at S3 Standard list price). NOTE: this
+    is real storage — reset (small seed) or delete the bucket when done.
+    """
+    c = _client()
+    _wipe(c)
+
+    # size ladder, built once in a scratch prefix, deleted at the end
+    c.put_object(Bucket=BUCKET, Key=SCRATCH + "base16.bin", Body=b"0" * (16 * MiB))
+    _assemble(c, SCRATCH + "chunk256.bin", SCRATCH + "base16.bin", 16)   # 256 MiB
+    _assemble(c, SCRATCH + "chunk1g.bin", SCRATCH + "chunk256.bin", 4)   # 1 GiB
+    chunk = SCRATCH + "chunk1g.bin"
+
+    # Big objects, all built concurrently (independent multipart assemblies).
+    # backups: keep_newest=3 -> 2 OLDEST are candidates (15 GiB each = 30 GiB);
+    # newer 3 kept small. logs: keyword 'log' -> all candidates (3 x 10 GiB).
+    from concurrent.futures import ThreadPoolExecutor
+
+    big = [
+        ("backups/db/full-00.dump", 15), ("backups/db/full-01.dump", 15),
+        ("backups/db/full-02.dump", 2), ("backups/db/full-03.dump", 2),
+        ("backups/db/full-04.dump", 2),
+        ("logs/app/archive-0.log", 10), ("logs/app/archive-1.log", 10),
+        ("logs/app/archive-2.log", 10),
+    ]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda t: _assemble(c, t[0], chunk, t[1]), big))
+
+    # --- the rest of the feature demo, at small size ---
+    def put(key, body):
+        c.put_object(Bucket=BUCKET, Key=key, Body=body)
+
+    for i in range(4):
+        put(f"build/cache-{i}.tmp", b"x" * 2048)          # temp artifacts
+    for i in range(5):
+        put(f"invoices/2010/invoice-{i:04}.pdf", b"%PDF old")  # old invoices
+    put("invoices/2025/invoice-9999.pdf", b"%PDF recent")      # NOT a candidate
+    dup = b"IDENTICAL DUPLICATE PAYLOAD " * 64                  # exact duplicates
+    put("data/report-copy-a.bin", dup)
+    put("archive/report-copy-b.bin", dup)
+    put("backup/report-copy-c.bin", dup)
+    for i in range(3):
+        put(f"legal-hold/case-42/evidence-{i}.zip", b"sealed")  # protected
+    c.create_multipart_upload(Bucket=BUCKET, Key="uploads/interrupted-huge.bin")
+
+    # remove the scratch ladder; the big objects are independent copies now
+    _wipe_prefix(c, SCRATCH)
+    return get_state()
+
+
+def _wipe_prefix(c, prefix):
+    keys = []
+    for page in c.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=prefix):
+        for item in page.get("Contents", []):
+            keys.append({"Key": item["Key"]})
+    if keys:
+        c.delete_objects(Bucket=BUCKET, Delete={"Objects": keys})
+
+
 # ---- read state ------------------------------------------------------------
 RULE_OF_PREFIX = _config()
 
@@ -371,7 +473,11 @@ def action_run(payload: dict) -> dict:
 ACTIONS = {
     "scan": lambda p: {"message": "Scan complete.", "state": get_state()},
     "run": action_run,
-    "reset": lambda p: {"message": "Bucket reset and repopulated.", "state": seed_bucket()},
+    "reset": lambda p: {"message": "Bucket reset (small demo scenario).", "state": seed_bucket()},
+    "reset_large": lambda p: {
+        "message": "Bucket seeded with multi-GB data (real storage — reset when done).",
+        "state": seed_large(),
+    },
 }
 
 

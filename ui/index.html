@@ -111,7 +111,8 @@
   <span class="bucket" id="bucketName">—</span>
   <span class="spacer"></span>
   <button id="refreshBtn">↻ Refresh</button>
-  <button id="resetBtn" class="danger">⟲ Reset &amp; repopulate bucket</button>
+  <button id="largeBtn">▤ Load large dataset (~66 GiB)</button>
+  <button id="resetBtn" class="danger">⟲ Reset (small demo)</button>
 </header>
 
 <div class="wrap">
@@ -346,6 +347,19 @@ async function resetBucket(){
   finally { $("resetBtn").classList.remove("spin"); }
 }
 
+async function loadLarge(){
+  if (!confirm("Seed ~66 GiB of REAL data (built server-side, no upload) so dollar savings are visible?\n\nThis is real S3 storage (~$1.50/mo until you Reset or delete the bucket). Continue?")) return;
+  $("largeBtn").classList.add("spin");
+  banner("Building ~66 GiB server-side… this takes a few minutes.","ok");
+  try {
+    const res = await fetch("/api/action/reset_large", {method:"POST"});
+    const data = await res.json();
+    banner(data.message,"ok"); logLine("large seed: "+data.message,"ok");
+    if (data.state) render(data.state);
+  } catch(e){ banner("large seed failed: "+e,"err"); }
+  finally { $("largeBtn").classList.remove("spin"); }
+}
+
 async function refresh(){
   try {
     const res = await fetch("/api/state");
@@ -362,6 +376,7 @@ function render(s){
 
 $("refreshBtn").onclick = refresh;
 $("resetBtn").onclick = resetBucket;
+$("largeBtn").onclick = loadLarge;
 renderSteps();
 refresh();
 </script>
