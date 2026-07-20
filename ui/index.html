@@ -80,6 +80,8 @@
   .run-result .line { font-size: 13px; padding: 3px 0; display: flex; gap: 8px; align-items: baseline; }
   .run-result .line::before { content: "›"; color: var(--muted); }
   .run-result .line.err { color: var(--critical); }
+  .prog { flex: 1; min-width: 140px; height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; margin-left: 8px; }
+  .prog-fill { height: 100%; background: var(--live); border-radius: 4px; transition: width .3s ease; }
   button {
     font: inherit; border: 1px solid var(--grid); background: var(--surface-2);
     color: var(--text-primary); border-radius: 7px; padding: 7px 12px; cursor: pointer;
@@ -315,24 +317,53 @@ function collectRun(){
   return {apply, steps};
 }
 
+let pollTimer = null;
+
+function renderProgress(p){
+  const rr=$("runResult");
+  rr.className="run-result show";
+  const pct = p.total ? Math.round((p.done/p.total)*100) : (p.running?0:100);
+  const bar = `<div class="prog"><div class="prog-fill" style="width:${pct}%"></div></div>`;
+  const cur = p.running
+    ? `<div class="line"><b>${p.message}</b></div>`+
+      (p.action ? `<div class="line">${p.action}: ${p.done}${p.total?'/'+p.total:''}${p.total?` (${pct}%)`:''} ${bar}</div>` : bar)
+    : `<div class="line"><b>${p.message}</b>${p.error?` — <span style="color:var(--critical)">${p.error}</span>`:''}</div>`;
+  const done = (p.steps_result||[]).map(m=>`<div class="line ${/error|guardrail/.test(m)?'err':''}">${m}</div>`).join("");
+  rr.innerHTML = cur + done;
+}
+
+async function pollProgress(){
+  try {
+    const res = await fetch("/api/progress");
+    const p = await res.json();
+    renderProgress(p);
+    if (p.finished){
+      clearInterval(pollTimer); pollTimer=null;
+      $("runBtn").classList.remove("spin"); setRunDisabled(false);
+      banner(p.message + (p.error?` (${p.error})`:""), p.error?"err":"ok");
+      logLine(p.message+" "+(p.steps_result||[]).join(" | "), p.error?"err":"ok");
+      if (p.state) render(p.state);
+    }
+  } catch(e){ /* transient; keep polling */ }
+}
+
+function setRunDisabled(d){ $("runBtn").disabled=d; $("selectAll").disabled=d; $("clearAll").disabled=d; }
+
 async function runSelected(){
+  if (pollTimer) return; // a run is already being tracked
   const payload = collectRun();
   const selected = Object.entries(payload.steps).filter(([,v])=>v.enabled).map(([k])=>k);
   if (!selected.length){ banner("Tick at least one clean to run.","err"); return; }
   if (payload.apply && !confirm(`Apply ${selected.length} clean(s) to the bucket? This makes real changes.`)) return;
-  $("runBtn").classList.add("spin"); $("runResult").className="run-result";
+  $("runBtn").classList.add("spin"); setRunDisabled(true);
   try {
     const res = await fetch("/api/action/run", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
     const data = await res.json();
-    banner(data.message + (data.error?` (${data.error})`:""), data.error?"err":"ok");
-    logLine(data.message+" "+(data.steps_result||[]).join(" | "), data.error?"err":"ok");
-    const rr=$("runResult");
-    rr.className="run-result show";
-    rr.innerHTML=`<div class="line"><b>${data.message}</b></div>`+
-      (data.steps_result||[]).map(m=>`<div class="line ${/error|guardrail/.test(m)?'err':''}">${m}</div>`).join("");
-    if (data.state) render(data.state);
-  } catch(e){ banner("run failed: "+e,"err"); }
-  finally { $("runBtn").classList.remove("spin"); }
+    if (data.error){ banner(data.error,"err"); $("runBtn").classList.remove("spin"); setRunDisabled(false); return; }
+    // start polling live progress
+    renderProgress({running:true, message:"Starting…", action:null, done:0, total:0, steps_result:[]});
+    pollTimer = setInterval(pollProgress, 400);
+  } catch(e){ banner("run failed: "+e,"err"); $("runBtn").classList.remove("spin"); setRunDisabled(false); }
 }
 
 async function resetBucket(){

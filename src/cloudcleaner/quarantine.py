@@ -12,6 +12,7 @@ import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from threading import Lock
 from datetime import datetime, timedelta, timezone
 
 from cloudcleaner.adapters import StorageAdapter
@@ -122,6 +123,7 @@ class QuarantineManager:
         config: Config,
         now: datetime | None = None,
         max_workers: int = DEFAULT_MAX_WORKERS,
+        progress=None,
     ):
         self.adapter = adapter
         self.config = config
@@ -129,6 +131,20 @@ class QuarantineManager:
         self.prefix = config.quarantine.prefix
         self.q_bucket = config.quarantine.bucket or config.bucket
         self.max_workers = max(1, max_workers)
+        # Optional progress sink: called as progress(done, total, action) after
+        # each object is processed. Invoked under a lock so it is thread-safe
+        # even when work runs across the pool. Defaults to a no-op.
+        self._progress = progress or (lambda done, total, action: None)
+        self._progress_lock = Lock()
+
+    def _tick(self, total: int, action: str) -> int:
+        """Atomically advance the progress counter and notify the sink.
+        Returns the new count. Safe to call from pool threads."""
+        with self._progress_lock:
+            self._done += 1
+            done = self._done
+            self._progress(done, total, action)
+        return done
 
     def _manifest_key(self, batch_id: str) -> str:
         return f"{self.prefix}{batch_id}/{MANIFEST_NAME}"
@@ -186,10 +202,14 @@ class QuarantineManager:
             created_at=self.now.isoformat(),
             purge_after=purge_after.isoformat(),
         )
+        total = len(candidates)
+        self._done = 0
+
         def _move(cand: Candidate) -> ManifestEntry:
             q_key = f"{self.prefix}{batch_id}/objects/{cand.obj.key}"
             self.adapter.copy(self.config.bucket, cand.obj.key, self.q_bucket, q_key)
             self.adapter.delete(self.config.bucket, cand.obj.key)
+            self._tick(total, "quarantine")
             return ManifestEntry(
                 original_key=cand.obj.key,
                 quarantine_key=q_key,
@@ -199,7 +219,7 @@ class QuarantineManager:
 
         # Copy+delete are network-bound; run them concurrently. executor.map
         # preserves input order, so the manifest entries stay deterministic.
-        workers = min(self.max_workers, len(candidates)) or 1
+        workers = min(self.max_workers, total) or 1
         if workers == 1:
             manifest.entries = [_move(c) for c in candidates]
         else:
@@ -251,24 +271,38 @@ class QuarantineManager:
         manifest = batches[batch_id]
 
         wanted = set(keys) if keys else None
-        restored, kept = [], []
-        for entry in manifest.entries:
-            if wanted is not None and entry.original_key not in wanted:
-                kept.append(entry)
-                continue
-            if self._quarantine_exists(entry.quarantine_key):
+        targets = [e for e in manifest.entries if wanted is None or e.original_key in wanted]
+        kept = [e for e in manifest.entries if wanted is not None and e.original_key not in wanted]
+        total = len(targets)
+        self._done = 0
+
+        # List the batch's surviving quarantine objects once, so the crash-safe
+        # "already restored?" check is a set lookup rather than one list call
+        # per entry (which would double the API traffic on the happy path).
+        batch_object_prefix = f"{self.prefix}{manifest.batch_id}/objects/"
+        present = {
+            o.key for o in self.adapter.list_objects(self.q_bucket, prefix=batch_object_prefix)
+        }
+
+        def _restore_one(entry: ManifestEntry) -> ManifestEntry:
+            # A missing quarantine copy means a prior restore was interrupted
+            # after moving this object back but before rewriting the manifest;
+            # treat it as already-restored so a re-run converges (idempotent).
+            if entry.quarantine_key in present:
                 self.adapter.copy(
                     self.q_bucket, entry.quarantine_key, manifest.bucket, entry.original_key
                 )
                 self.adapter.delete(self.q_bucket, entry.quarantine_key)
-                restored.append(entry)
-            else:
-                # The quarantine copy is already gone — a prior restore of this
-                # batch was interrupted after moving this object back but before
-                # the manifest was rewritten. Treat it as already-restored so a
-                # re-run converges (idempotent) instead of failing to copy a
-                # source that no longer exists.
-                restored.append(entry)
+            self._tick(total, "restore")
+            return entry
+
+        # Copy+delete per object are network-bound; run them concurrently.
+        workers = min(self.max_workers, total) or 1
+        if workers == 1:
+            restored = [_restore_one(e) for e in targets]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                restored = list(pool.map(_restore_one, targets))
 
         if wanted is not None:
             missing = wanted - {e.original_key for e in restored}
@@ -282,11 +316,3 @@ class QuarantineManager:
             self.adapter.delete(self.q_bucket, self._manifest_key(batch_id))
         self._append_audit("restore", batch_id, restored)
         return restored
-
-    def _quarantine_exists(self, quarantine_key: str) -> bool:
-        """Whether a quarantined object is still present (adapter-agnostic:
-        probes via list_objects rather than a backend-specific head call)."""
-        for obj in self.adapter.list_objects(self.q_bucket, prefix=quarantine_key):
-            if obj.key == quarantine_key:
-                return True
-        return False

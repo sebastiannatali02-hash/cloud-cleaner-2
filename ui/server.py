@@ -20,6 +20,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Lock, Thread
 
 # Make the package importable when run from the repo root or ui/.
 ROOT = Path(__file__).resolve().parent.parent
@@ -351,10 +352,48 @@ def get_state() -> dict:
     }
 
 
+# ---- live progress ---------------------------------------------------------
+# A single run executes in a background thread; the page polls /api/progress.
+# PROGRESS holds the current run's status. Steps push updates into it.
+_PROGRESS_LOCK = Lock()
+PROGRESS = {
+    "running": False,
+    "action": None,      # current step name
+    "done": 0,
+    "total": 0,
+    "steps_result": [],  # completed step messages
+    "message": "",       # headline
+    "error": None,
+    "finished": False,
+}
+
+
+def _progress_reset(headline: str):
+    with _PROGRESS_LOCK:
+        PROGRESS.update(running=True, action=None, done=0, total=0,
+                        steps_result=[], message=headline, error=None, finished=False)
+
+
+def _progress_set(**kw):
+    with _PROGRESS_LOCK:
+        PROGRESS.update(**kw)
+
+
+def _progress_snapshot() -> dict:
+    with _PROGRESS_LOCK:
+        return dict(PROGRESS)
+
+
+def _make_sink(step_name: str):
+    """A progress callback for QuarantineManager: (done, total, action)."""
+    def sink(done, total, action):
+        _progress_set(action=step_name, done=done, total=total)
+    return sink
+
+
 # ---- clean steps -----------------------------------------------------------
 # Each step is `fn(apply, opts) -> (message, is_error)` — it does the work but
-# does NOT compute state; the endpoint attaches state once. This lets several
-# steps compose into a single run without recomputing state per step.
+# does NOT compute state; the runner attaches state once at the end.
 def step_dedup(apply: bool, opts: dict) -> tuple[str, bool]:
     adapter = _adapter()
     config = _config()
@@ -363,11 +402,13 @@ def step_dedup(apply: bool, opts: dict) -> tuple[str, bool]:
     if not groups:
         return "dedup: no exact duplicates found.", False
     redundant = [m.key for g in groups for m in choose_redundant(g, keep=keep)]
+    _progress_set(action="dedup", done=0, total=len(redundant))
     if not apply:
         return f"dedup: would remove {len(redundant)} redundant copy(ies) (keep {keep}).", False
     from cloudcleaner.bulk import bulk_delete
 
     bulk_delete(adapter, BUCKET, redundant)
+    _progress_set(action="dedup", done=len(redundant), total=len(redundant))
     return f"dedup: deleted {len(redundant)} redundant duplicate copy(ies).", False
 
 
@@ -377,9 +418,11 @@ def step_multipart(apply: bool, opts: dict) -> tuple[str, bool]:
     uploads = find_incomplete_uploads(adapter, BUCKET, older_than=older)
     if not uploads:
         return "multipart: no incomplete uploads matched.", False
+    _progress_set(action="multipart", done=0, total=len(uploads))
     if not apply:
         return f"multipart: would abort {len(uploads)} incomplete upload(s).", False
     count, reclaimed = abort_uploads(adapter, BUCKET, uploads)
+    _progress_set(action="multipart", done=count, total=len(uploads))
     return f"multipart: aborted {count} upload(s), reclaimed ~{reclaimed} bytes.", False
 
 
@@ -399,7 +442,7 @@ def step_quarantine(apply: bool, opts: dict) -> tuple[str, bool]:
             check_guardrail(result, GuardrailLimits.from_dict(config.quarantine.guardrail))
         except GuardrailViolation as exc:
             return f"quarantine: guardrail: {exc}", True
-    manager = QuarantineManager(adapter, config)
+    manager = QuarantineManager(adapter, config, progress=_make_sink("quarantine"))
     manifest = manager.quarantine(result.candidates)
     return f"quarantine: moved {len(manifest.entries)} object(s) as batch {manifest.batch_id}.", False
 
@@ -411,17 +454,19 @@ def step_purge(apply: bool, opts: dict) -> tuple[str, bool]:
     batches = manager.list_batches() if opts.get("force") else manager.expired_batches()
     if not batches:
         return "purge: no purgeable batches (retention still open; tick force to override).", False
+    n = sum(len(m.entries) for m in batches)
+    _progress_set(action="purge", done=0, total=n)
     if not apply:
-        n = sum(len(m.entries) for m in batches)
         return f"purge: would permanently delete {n} object(s).", False
     freed = manager.purge(batches)
+    _progress_set(action="purge", done=n, total=n)
     return f"purge: permanently deleted {freed} bytes across {len(batches)} batch(es).", False
 
 
 def step_restore(apply: bool, opts: dict) -> tuple[str, bool]:
     adapter = _adapter()
     config = _config()
-    manager = QuarantineManager(adapter, config)
+    manager = QuarantineManager(adapter, config, progress=_make_sink("restore"))
     batches = manager.list_batches()
     if not batches:
         return "restore: no quarantine batches to restore.", False
@@ -444,16 +489,11 @@ STEPS = {
 RUN_ORDER = ["dedup", "multipart", "quarantine", "purge", "restore"]
 
 
-def action_run(payload: dict) -> dict:
-    """Run a composed cleanup: the ticked steps, each with its own options,
-    under one master apply/force switch (per-step force may also be set)."""
-    apply = bool(payload.get("apply", False))
-    steps = payload.get("steps", {}) or {}
-    selected = [name for name in RUN_ORDER if steps.get(name, {}).get("enabled")]
-    if not selected:
-        return {"error": "No cleans selected — tick at least one.", "state": get_state()}
+def _run_worker(apply: bool, steps: dict, selected: list):
+    """Executes the selected steps in a background thread, updating PROGRESS."""
     messages, had_error = [], False
     for name in selected:
+        _progress_set(action=name, done=0, total=0)
         opts = dict(steps.get(name, {}))
         try:
             msg, is_err = STEPS[name](apply, opts)
@@ -461,13 +501,25 @@ def action_run(payload: dict) -> dict:
             msg, is_err = f"{name}: error: {exc}", True
         messages.append(msg)
         had_error = had_error or is_err
-    header = ("Applied" if apply else "Dry run —") + f" {len(selected)} clean(s):"
-    return {
-        "message": header,
-        "steps_result": messages,
-        "error": ("one or more steps reported a problem" if had_error else None),
-        "state": get_state(),
-    }
+        _progress_set(steps_result=list(messages))
+    header = ("Applied" if apply else "Dry run —") + f" {len(selected)} clean(s)."
+    _progress_set(running=False, finished=True, action=None, message=header,
+                  error=("one or more steps reported a problem" if had_error else None))
+
+
+def action_run(payload: dict) -> dict:
+    """Kick off a composed cleanup in the background and return immediately.
+    The page polls /api/progress for live status."""
+    if _progress_snapshot()["running"]:
+        return {"error": "A run is already in progress."}
+    apply = bool(payload.get("apply", False))
+    steps = payload.get("steps", {}) or {}
+    selected = [name for name in RUN_ORDER if steps.get(name, {}).get("enabled")]
+    if not selected:
+        return {"error": "No cleans selected — tick at least one."}
+    _progress_reset(("Applying" if apply else "Previewing") + f" {len(selected)} clean(s)…")
+    Thread(target=_run_worker, args=(apply, steps, selected), daemon=True).start()
+    return {"started": True, "selected": selected}
 
 
 ACTIONS = {
@@ -503,6 +555,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(get_state()))
             except Exception as exc:  # noqa: BLE001
                 return self._send(500, json.dumps({"error": str(exc)}))
+        if self.path == "/api/progress":
+            snap = _progress_snapshot()
+            # Attach fresh bucket state once the run has finished so the page
+            # can render the final result without a second request.
+            if snap.get("finished"):
+                try:
+                    snap["state"] = get_state()
+                except Exception as exc:  # noqa: BLE001
+                    snap["error"] = snap.get("error") or str(exc)
+            return self._send(200, json.dumps(snap))
         return self._send(404, json.dumps({"error": "not found"}))
 
     def do_POST(self):
