@@ -352,6 +352,35 @@ def get_state() -> dict:
     }
 
 
+# ---- single-flight bucket gate ---------------------------------------------
+# Every mutating action (run / reset / reset_large) touches the one shared
+# bucket. Concurrent mutations race (interleaved manifest writes, half-restored
+# batches), so only ONE may be in flight at a time. This gate is authoritative
+# regardless of how the action was triggered (UI or direct API call).
+_BUSY_LOCK = Lock()
+_BUSY = {"active": None}  # label of the in-flight mutating action, or None
+
+
+def try_begin(label: str) -> bool:
+    """Claim the bucket for a mutating action. Returns False if one is already
+    running (caller should reject)."""
+    with _BUSY_LOCK:
+        if _BUSY["active"] is not None:
+            return False
+        _BUSY["active"] = label
+        return True
+
+
+def end() -> None:
+    with _BUSY_LOCK:
+        _BUSY["active"] = None
+
+
+def busy_label():
+    with _BUSY_LOCK:
+        return _BUSY["active"]
+
+
 # ---- live progress ---------------------------------------------------------
 # A single run executes in a background thread; the page polls /api/progress.
 # PROGRESS holds the current run's status. Steps push updates into it.
@@ -490,46 +519,64 @@ RUN_ORDER = ["dedup", "multipart", "quarantine", "purge", "restore"]
 
 
 def _run_worker(apply: bool, steps: dict, selected: list):
-    """Executes the selected steps in a background thread, updating PROGRESS."""
-    messages, had_error = [], False
-    for name in selected:
-        _progress_set(action=name, done=0, total=0)
-        opts = dict(steps.get(name, {}))
-        try:
-            msg, is_err = STEPS[name](apply, opts)
-        except Exception as exc:  # noqa: BLE001
-            msg, is_err = f"{name}: error: {exc}", True
-        messages.append(msg)
-        had_error = had_error or is_err
-        _progress_set(steps_result=list(messages))
-    header = ("Applied" if apply else "Dry run —") + f" {len(selected)} clean(s)."
-    _progress_set(running=False, finished=True, action=None, message=header,
-                  error=("one or more steps reported a problem" if had_error else None))
+    """Executes the selected steps in a background thread, updating PROGRESS.
+    Always releases the bucket gate, even on error."""
+    try:
+        messages, had_error = [], False
+        for name in selected:
+            _progress_set(action=name, done=0, total=0)
+            opts = dict(steps.get(name, {}))
+            try:
+                msg, is_err = STEPS[name](apply, opts)
+            except Exception as exc:  # noqa: BLE001
+                msg, is_err = f"{name}: error: {exc}", True
+            messages.append(msg)
+            had_error = had_error or is_err
+            _progress_set(steps_result=list(messages))
+        header = ("Applied" if apply else "Dry run —") + f" {len(selected)} clean(s)."
+        _progress_set(running=False, finished=True, action=None, message=header,
+                      error=("one or more steps reported a problem" if had_error else None))
+    finally:
+        end()
 
 
 def action_run(payload: dict) -> dict:
     """Kick off a composed cleanup in the background and return immediately.
     The page polls /api/progress for live status."""
-    if _progress_snapshot()["running"]:
-        return {"error": "A run is already in progress."}
     apply = bool(payload.get("apply", False))
     steps = payload.get("steps", {}) or {}
     selected = [name for name in RUN_ORDER if steps.get(name, {}).get("enabled")]
     if not selected:
         return {"error": "No cleans selected — tick at least one."}
+    # Single-flight: claim the bucket before starting. Rejects if any mutating
+    # action (another run, or a reset) is in flight.
+    if not try_begin("run"):
+        return {"error": f"Busy: '{busy_label()}' is already running against the bucket."}
     _progress_reset(("Applying" if apply else "Previewing") + f" {len(selected)} clean(s)…")
     Thread(target=_run_worker, args=(apply, steps, selected), daemon=True).start()
     return {"started": True, "selected": selected}
 
 
+def _guarded_seed(label: str, fn, message: str) -> dict:
+    """Run a synchronous bucket-mutating seed under the single-flight gate."""
+    if not try_begin(label):
+        return {"error": f"Busy: '{busy_label()}' is already running against the bucket."}
+    try:
+        return {"message": message, "state": fn()}
+    finally:
+        end()
+
+
 ACTIONS = {
     "scan": lambda p: {"message": "Scan complete.", "state": get_state()},
     "run": action_run,
-    "reset": lambda p: {"message": "Bucket reset (small demo scenario).", "state": seed_bucket()},
-    "reset_large": lambda p: {
-        "message": "Bucket seeded with multi-GB data (real storage — reset when done).",
-        "state": seed_large(),
-    },
+    "reset": lambda p: _guarded_seed(
+        "reset", seed_bucket, "Bucket reset (small demo scenario)."
+    ),
+    "reset_large": lambda p: _guarded_seed(
+        "reset_large", seed_large,
+        "Bucket seeded with multi-GB data (real storage — reset when done).",
+    ),
 }
 
 
