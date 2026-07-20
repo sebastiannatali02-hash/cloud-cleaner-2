@@ -184,12 +184,19 @@ def cmd_restore(args) -> int:
 
 def cmd_dedup(args) -> int:
     from cloudcleaner.dedup import choose_redundant, find_duplicates, total_reclaimable
+    from cloudcleaner.rules import ExclusionPolicy
 
     config = _load(args)
     adapter = get_adapter(config)
-    groups = find_duplicates(
-        adapter.list_objects(config.bucket, prefix=config.prefix), min_size=args.min_size
+    # Honor exclusions (e.g. legal-hold/) and never touch the quarantine
+    # prefix — dedup must respect the same protections as the rule engine.
+    exclusions = ExclusionPolicy(config.exclude, config.quarantine.prefix)
+    objects = (
+        o
+        for o in adapter.list_objects(config.bucket, prefix=config.prefix)
+        if not exclusions.is_excluded(o.key)
     )
+    groups = find_duplicates(objects, min_size=args.min_size)
     if not groups:
         print("No exact-duplicate objects found (by ETag + size).")
         return 0
