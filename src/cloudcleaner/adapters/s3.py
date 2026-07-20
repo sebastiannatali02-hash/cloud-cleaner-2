@@ -27,6 +27,7 @@ class S3Adapter:
                     size_bytes=item["Size"],
                     last_modified=item["LastModified"],
                     storage_class=item.get("StorageClass", "STANDARD"),
+                    etag=item.get("ETag"),
                 )
 
     def copy(self, bucket: str, key: str, dst_bucket: str, dst_key: str) -> None:
@@ -75,3 +76,49 @@ class S3Adapter:
                 raise KeyError(key) from exc
             raise
         return response["Body"].read().decode("utf-8")
+
+    # ----------------------------------------------------------------- #
+    # Incomplete multipart uploads
+    #
+    # Failed/abandoned multipart uploads leave orphaned parts that AWS
+    # bills for but that never show up in a normal ``list_objects_v2``
+    # listing. These helpers surface them and (via the multipart module)
+    # let the tool abort them.
+    # ----------------------------------------------------------------- #
+    def list_multipart_uploads(self, bucket: str) -> Iterator[dict]:
+        """Yield one record per in-progress/incomplete multipart upload.
+
+        Each record is a plain dict with ``key``, ``upload_id``,
+        ``initiated`` (a datetime) and ``size_bytes`` (the aggregate size
+        of the uploaded parts, or ``None`` if it could not be determined).
+        The aggregate size requires a ``list_parts`` call per upload; if
+        that fails for any reason we degrade gracefully to ``None`` rather
+        than aborting the whole listing.
+        """
+        paginator = self._client.get_paginator("list_multipart_uploads")
+        for page in paginator.paginate(Bucket=bucket):
+            for upload in page.get("Uploads", []):
+                key = upload["Key"]
+                upload_id = upload["UploadId"]
+                yield {
+                    "key": key,
+                    "upload_id": upload_id,
+                    "initiated": upload.get("Initiated"),
+                    "size_bytes": self._multipart_size(bucket, key, upload_id),
+                }
+
+    def _multipart_size(self, bucket: str, key: str, upload_id: str) -> int | None:
+        """Sum the sizes of the already-uploaded parts of an upload."""
+        try:
+            paginator = self._client.get_paginator("list_parts")
+            total = 0
+            for page in paginator.paginate(Bucket=bucket, Key=key, UploadId=upload_id):
+                for part in page.get("Parts", []):
+                    total += part.get("Size", 0)
+            return total
+        except Exception:
+            return None
+
+    def abort_multipart_upload(self, bucket: str, key: str, upload_id: str) -> None:
+        """Abort a multipart upload, deleting its orphaned parts."""
+        self._client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)

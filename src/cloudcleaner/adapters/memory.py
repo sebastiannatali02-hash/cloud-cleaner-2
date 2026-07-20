@@ -11,6 +11,8 @@ class MemoryAdapter:
     def __init__(self):
         # bucket -> key -> (StorageObject, text content or None)
         self.buckets: dict[str, dict[str, tuple[StorageObject, str | None]]] = {}
+        # bucket -> list of multipart upload records (plain dicts)
+        self.multipart: dict[str, list[dict]] = {}
 
     def seed(self, bucket: str, objects: list[StorageObject]) -> None:
         store = self.buckets.setdefault(bucket, {})
@@ -55,3 +57,36 @@ class MemoryAdapter:
         if text is None:
             raise KeyError(f"{key} has no text content")
         return text
+
+    # ----------------------------------------------------------------- #
+    # Incomplete multipart uploads (in-memory stub)
+    # ----------------------------------------------------------------- #
+    def seed_multipart(
+        self,
+        bucket: str,
+        key: str,
+        upload_id: str,
+        initiated: "datetime",
+        size_bytes: int | None = None,
+    ) -> None:
+        """Register an in-progress multipart upload for testing."""
+        self.multipart.setdefault(bucket, []).append(
+            {
+                "key": key,
+                "upload_id": upload_id,
+                "initiated": initiated,
+                "size_bytes": size_bytes,
+            }
+        )
+
+    def list_multipart_uploads(self, bucket: str) -> Iterator[dict]:
+        """Yield a copy of each incomplete multipart upload record."""
+        for record in self.multipart.get(bucket, []):
+            yield dict(record)
+
+    def abort_multipart_upload(self, bucket: str, key: str, upload_id: str) -> None:
+        """Drop the matching upload record, if present."""
+        uploads = self.multipart.get(bucket, [])
+        self.multipart[bucket] = [
+            u for u in uploads if not (u["key"] == key and u["upload_id"] == upload_id)
+        ]

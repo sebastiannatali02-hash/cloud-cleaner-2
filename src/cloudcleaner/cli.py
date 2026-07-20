@@ -82,6 +82,21 @@ def cmd_quarantine(args) -> int:
         print("\nDry run: no changes made. Re-run with --apply to quarantine these objects.")
         return 0
 
+    # Blast-radius guardrail: refuse an --apply that would quarantine an
+    # unexpectedly large share of the bucket, unless --force overrides.
+    if not args.force:
+        from cloudcleaner.guardrail import (
+            GuardrailLimits,
+            GuardrailViolation,
+            check_guardrail,
+        )
+
+        try:
+            check_guardrail(result, GuardrailLimits.from_dict(config.quarantine.guardrail))
+        except GuardrailViolation as exc:
+            print(f"guardrail: {exc}", file=sys.stderr)
+            return 1
+
     manager = QuarantineManager(adapter, config)
     manifest = manager.quarantine(result.candidates)
     print(
@@ -167,6 +182,65 @@ def cmd_restore(args) -> int:
     return 0
 
 
+def cmd_dedup(args) -> int:
+    from cloudcleaner.dedup import choose_redundant, find_duplicates, total_reclaimable
+
+    config = _load(args)
+    adapter = get_adapter(config)
+    groups = find_duplicates(
+        adapter.list_objects(config.bucket, prefix=config.prefix), min_size=args.min_size
+    )
+    if not groups:
+        print("No exact-duplicate objects found (by ETag + size).")
+        return 0
+
+    redundant_total = 0
+    for g in groups:
+        redundant = choose_redundant(g, keep=args.keep)
+        redundant_total += len(redundant)
+        print(
+            f"{g.count} copies, {human_size(g.size_bytes)} each "
+            f"(reclaimable {human_size(g.redundant_bytes)}) — etag {g.etag}:"
+        )
+        kept = [m for m in g.members if m not in redundant]
+        for m in kept:
+            print(f"  keep    {m.key}")
+        for m in redundant:
+            print(f"  redundant {m.key}")
+    print(
+        f"\n{len(groups)} duplicate group(s), {redundant_total} redundant object(s), "
+        f"{human_size(total_reclaimable(groups))} reclaimable (keeping one per group)."
+    )
+    return 0
+
+
+def cmd_multipart(args) -> int:
+    from cloudcleaner.multipart import abort_uploads, find_incomplete_uploads
+
+    config = _load(args)
+    adapter = get_adapter(config)
+    uploads = find_incomplete_uploads(adapter, config.bucket, older_than=args.older_than)
+    if not uploads:
+        print("No incomplete multipart uploads found.")
+        return 0
+
+    for u in uploads:
+        size = human_size(u.size_bytes) if u.size_bytes is not None else "unknown size"
+        print(f"  {u.key}  [upload {u.upload_id}, initiated {u.initiated}, {size}]")
+
+    total = sum(u.size_bytes or 0 for u in uploads)
+    if not args.apply:
+        print(
+            f"\nDry run: would abort {len(uploads)} incomplete upload(s), "
+            f"reclaiming ~{human_size(total)}. Re-run with --apply to abort them."
+        )
+        return 0
+
+    count, reclaimed = abort_uploads(adapter, config.bucket, uploads)
+    print(f"Aborted {count} incomplete upload(s), reclaimed ~{human_size(reclaimed)}.")
+    return 0
+
+
 def cmd_demo(args) -> int:
     from cloudcleaner.demo import run_demo
 
@@ -212,6 +286,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(p)
     p.add_argument("--apply", action="store_true", help="actually move objects (default: dry run)")
     p.add_argument("--limit", type=int, default=20, help="max candidates shown in dry run")
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="override the blast-radius guardrail (quarantine even a large share of the bucket)",
+    )
     p.set_defaults(func=cmd_quarantine)
 
     p = sub.add_parser("batches", help="list quarantine batches and their expiry")
@@ -236,6 +315,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch", required=True, help="quarantine batch id to restore from")
     p.add_argument("--key", action="append", help="restore only this original key (repeatable)")
     p.set_defaults(func=cmd_restore)
+
+    p = sub.add_parser("dedup", help="find exact-duplicate objects (by ETag + size)")
+    add_common(p)
+    p.add_argument(
+        "--min-size",
+        dest="min_size",
+        type=int,
+        default=0,
+        help="ignore objects smaller than this many bytes",
+    )
+    p.add_argument(
+        "--keep",
+        choices=["oldest", "newest"],
+        default="oldest",
+        help="which copy in each duplicate group to keep (default: oldest)",
+    )
+    p.set_defaults(func=cmd_dedup)
+
+    p = sub.add_parser("multipart", help="find/abort incomplete multipart uploads")
+    add_common(p)
+    p.add_argument(
+        "--older-than",
+        dest="older_than",
+        help="only uploads initiated before this age/date (e.g. 7d, 2027-01-01)",
+    )
+    p.add_argument(
+        "--apply", action="store_true", help="actually abort uploads (default: dry run)"
+    )
+    p.set_defaults(func=cmd_multipart)
 
     p = sub.add_parser("demo", help="run an offline demo on a simulated bucket")
     p.set_defaults(func=cmd_demo)
