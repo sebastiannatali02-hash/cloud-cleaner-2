@@ -256,9 +256,19 @@ class QuarantineManager:
             if wanted is not None and entry.original_key not in wanted:
                 kept.append(entry)
                 continue
-            self.adapter.copy(self.q_bucket, entry.quarantine_key, manifest.bucket, entry.original_key)
-            self.adapter.delete(self.q_bucket, entry.quarantine_key)
-            restored.append(entry)
+            if self._quarantine_exists(entry.quarantine_key):
+                self.adapter.copy(
+                    self.q_bucket, entry.quarantine_key, manifest.bucket, entry.original_key
+                )
+                self.adapter.delete(self.q_bucket, entry.quarantine_key)
+                restored.append(entry)
+            else:
+                # The quarantine copy is already gone — a prior restore of this
+                # batch was interrupted after moving this object back but before
+                # the manifest was rewritten. Treat it as already-restored so a
+                # re-run converges (idempotent) instead of failing to copy a
+                # source that no longer exists.
+                restored.append(entry)
 
         if wanted is not None:
             missing = wanted - {e.original_key for e in restored}
@@ -272,3 +282,11 @@ class QuarantineManager:
             self.adapter.delete(self.q_bucket, self._manifest_key(batch_id))
         self._append_audit("restore", batch_id, restored)
         return restored
+
+    def _quarantine_exists(self, quarantine_key: str) -> bool:
+        """Whether a quarantined object is still present (adapter-agnostic:
+        probes via list_objects rather than a backend-specific head call)."""
+        for obj in self.adapter.list_objects(self.q_bucket, prefix=quarantine_key):
+            if obj.key == quarantine_key:
+                return True
+        return False
