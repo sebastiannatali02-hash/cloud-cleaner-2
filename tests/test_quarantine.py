@@ -64,7 +64,11 @@ class TestQuarantineLifecycle:
         freed = later.purge(expired)
         assert freed == 150
         assert later.list_batches() == []
-        assert not any(k.startswith(config.quarantine.prefix) for k in keys(adapter, config.bucket))
+        # No per-batch objects/manifests survive the purge...
+        batch_prefix = f"{config.quarantine.prefix}{manifest.batch_id}/"
+        assert not any(k.startswith(batch_prefix) for k in keys(adapter, config.bucket))
+        # ...but the audit log (inside the prefix, by design) does.
+        assert later._audit_key() in keys(adapter, config.bucket)
 
     def test_restore_whole_batch(self, config, adapter):
         manager = QuarantineManager(adapter, config, now=NOW)
@@ -86,6 +90,27 @@ class TestQuarantineLifecycle:
         batches = manager.list_batches()
         assert len(batches) == 1
         assert [e.original_key for e in batches[0].entries] == ["build/cache.tmp"]
+
+    def test_restore_resumes_after_interruption(self, config, adapter):
+        # An interrupted restore can leave the manifest still listing an entry
+        # whose quarantine copy was already moved back and deleted. Re-running
+        # restore must converge (idempotent), not crash trying to copy a source
+        # that no longer exists.
+        manager = QuarantineManager(adapter, config, now=NOW)
+        manifest = manager.quarantine(scan(config, adapter).candidates)
+
+        # Simulate: one entry already restored (copied back + quarantine copy
+        # gone) but the manifest was never rewritten.
+        gone = manifest.entries[0]
+        adapter.copy(manager.q_bucket, gone.quarantine_key, manifest.bucket, gone.original_key)
+        adapter.delete(manager.q_bucket, gone.quarantine_key)
+
+        restored = manager.restore(manifest.batch_id)  # must not raise
+        assert {e.original_key for e in restored} == {e.original_key for e in manifest.entries}
+        remaining = keys(adapter, config.bucket)
+        for e in manifest.entries:
+            assert e.original_key in remaining
+        assert manager.list_batches() == []
 
     def test_restore_unknown_batch_or_key(self, config, adapter):
         manager = QuarantineManager(adapter, config, now=NOW)

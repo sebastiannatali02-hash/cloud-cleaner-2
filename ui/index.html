@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cloudcleaner — test console</title>
+<style>
+  :root {
+    --surface-0: #f4f4f1; --surface-1: #fcfcfb; --surface-2: #efeee9;
+    --text-primary: #0b0b0b; --text-secondary: #52514e; --muted: #898781;
+    --grid: #e1e0d9;
+    --live: #2a78d6;       /* blue: live objects */
+    --candidate: #eda100;  /* yellow: cleanup candidates */
+    --protected: #008300;  /* green: protected/legal-hold */
+    --quarantine: #e87ba4; /* magenta: quarantined */
+    --good: #0ca30c; --warning: #fab219; --critical: #d03b3b;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--surface-0); color: var(--text-primary);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    padding: 20px 28px; background: var(--surface-1); border-bottom: 1px solid var(--grid);
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 650; }
+  header .bucket { color: var(--muted); font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  header .spacer { flex: 1; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 24px 28px 64px; }
+  section { margin-bottom: 28px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 12px; font-weight: 600; }
+
+  /* KPI tiles */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 12px; }
+  .tile { background: var(--surface-1); border: 1px solid var(--grid); border-radius: var(--radius); padding: 14px 16px; }
+  .tile .label { color: var(--text-secondary); font-size: 12px; }
+  .tile .value { font-size: 24px; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .tile .sub { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .tile.accent-savings .value { color: var(--good); }
+
+  /* savings bar */
+  .savings-bar { background: var(--surface-1); border: 1px solid var(--grid); border-radius: var(--radius); padding: 18px; }
+  .bar-track { height: 26px; border-radius: 6px; background: var(--surface-2); overflow: hidden; display: flex; }
+  .bar-fill { height: 100%; }
+  .bar-legend { display: flex; gap: 20px; margin-top: 12px; font-size: 12px; color: var(--text-secondary); }
+  .bar-legend .k { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+
+  /* bucket viz */
+  .bucket-viz { background: var(--surface-1); border: 1px solid var(--grid); border-radius: var(--radius); padding: 8px 4px; }
+  .row { display: grid; grid-template-columns: 150px 1fr 120px; align-items: center; gap: 12px; padding: 7px 14px; }
+  .row .pfx { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row .track { height: 18px; background: var(--surface-2); border-radius: 4px; overflow: hidden; display: flex; }
+  .row .seg { height: 100%; }
+  .row .meta { text-align: right; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 10px 4px 0; font-size: 12px; color: var(--text-secondary); }
+  .legend .k { display: inline-flex; align-items: center; gap: 6px; }
+
+  /* cleanup runner */
+  .runner { background: var(--surface-1); border: 1px solid var(--grid); border-radius: var(--radius); overflow: hidden; }
+  .steps { }
+  .step { display: grid; grid-template-columns: 26px 1fr auto; gap: 12px; align-items: start; padding: 14px 18px; border-bottom: 1px solid var(--grid); }
+  .step.on { background: #f7fbff; }
+  .step .tick { margin-top: 2px; }
+  .step .tick input { width: 17px; height: 17px; cursor: pointer; }
+  .step .body .name { font-weight: 600; }
+  .step .body .desc { color: var(--text-secondary); font-size: 12px; margin-top: 2px; }
+  .step .cfg { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: flex-end; min-width: 180px; }
+  .step .cfg.disabled { opacity: .4; pointer-events: none; }
+  .step .cfg label { font-size: 12px; color: var(--text-secondary); display: inline-flex; align-items: center; gap: 5px; }
+  .step .cfg select, .step .cfg input[type=text] { font: inherit; font-size: 12px; padding: 3px 6px; border: 1px solid var(--grid); border-radius: 6px; background: var(--surface-1); }
+  .step .cfg input[type=text] { width: 80px; }
+  .runbar { display: flex; align-items: center; gap: 10px; padding: 14px 18px; background: var(--surface-2); flex-wrap: wrap; }
+  .runbar .mode { display: flex; gap: 16px; }
+  .runbar .spacer { flex: 1; }
+  .run-result { padding: 0 18px; }
+  .run-result.show { padding: 14px 18px; border-top: 1px solid var(--grid); }
+  .run-result .line { font-size: 13px; padding: 3px 0; display: flex; gap: 8px; align-items: baseline; }
+  .run-result .line::before { content: "›"; color: var(--muted); }
+  .run-result .line.err { color: var(--critical); }
+  .prog { flex: 1; min-width: 140px; height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; margin-left: 8px; }
+  .prog-fill { height: 100%; background: var(--live); border-radius: 4px; transition: width .3s ease; }
+  button {
+    font: inherit; border: 1px solid var(--grid); background: var(--surface-2);
+    color: var(--text-primary); border-radius: 7px; padding: 7px 12px; cursor: pointer;
+  }
+  button:hover { border-color: var(--muted); }
+  button.primary { background: var(--live); border-color: var(--live); color: #fff; }
+  button.danger { background: var(--critical); border-color: var(--critical); color: #fff; }
+  button.ghost { background: transparent; font-size: 12px; padding: 6px 10px; }
+  button:disabled { opacity: .5; cursor: default; }
+  label.chk { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-secondary); }
+
+  /* activity log */
+  .log { background: var(--surface-1); border: 1px solid var(--grid); border-radius: var(--radius); max-height: 240px; overflow: auto; }
+  .log .entry { padding: 8px 14px; border-bottom: 1px solid var(--grid); font-size: 13px; display: flex; gap: 10px; }
+  .log .entry:last-child { border-bottom: none; }
+  .log .t { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11px; white-space: nowrap; }
+  .log .entry.ok .m { color: var(--text-primary); }
+  .log .entry.err .m { color: var(--critical); }
+  .banner { padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 14px; display: none; }
+  .banner.show { display: block; }
+  .banner.ok { background: #e7f6e7; color: #085c08; }
+  .banner.err { background: #fbe6e6; color: #8a1a1a; }
+  .spin { opacity: .55; pointer-events: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>cloudcleaner</h1>
+  <span class="bucket" id="bucketName">—</span>
+  <span class="spacer"></span>
+  <button id="refreshBtn">↻ Refresh</button>
+  <button id="largeBtn">▤ Load large dataset (~66 GiB)</button>
+  <button id="resetBtn" class="danger">⟲ Reset (small demo)</button>
+</header>
+
+<div class="wrap">
+  <div class="banner" id="banner"></div>
+
+  <section>
+    <h2>Overview</h2>
+    <div class="tiles" id="tiles"></div>
+  </section>
+
+  <section>
+    <h2>Estimated monthly savings</h2>
+    <div class="savings-bar">
+      <div class="bar-track" id="savingsTrack"></div>
+      <div class="bar-legend" id="savingsLegend"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Bucket contents by prefix</h2>
+    <div class="bucket-viz" id="bucketViz"></div>
+    <div class="legend">
+      <span class="k"><span class="swatch" style="background:var(--live)"></span> live</span>
+      <span class="k"><span class="swatch" style="background:var(--candidate)"></span> cleanup candidate</span>
+      <span class="k"><span class="swatch" style="background:var(--protected)"></span> protected (legal-hold)</span>
+      <span class="k"><span class="swatch" style="background:var(--quarantine)"></span> quarantined</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Build a cleanup run</h2>
+    <div class="runner" id="runner">
+      <div class="steps" id="stepList"></div>
+      <div class="runbar">
+        <div class="mode">
+          <label class="chk"><input type="radio" name="mode" value="dry" checked> Dry run (preview only)</label>
+          <label class="chk"><input type="radio" name="mode" value="apply"> Apply (make changes)</label>
+        </div>
+        <span class="spacer"></span>
+        <button id="selectAll" class="ghost">Select all</button>
+        <button id="clearAll" class="ghost">Clear</button>
+        <button id="runBtn" class="primary">▶ Run selected cleans</button>
+      </div>
+      <div class="run-result" id="runResult"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Quarantine batches</h2>
+    <div class="bucket-viz" id="batches" style="padding:12px 16px;"></div>
+  </section>
+
+  <section>
+    <h2>Activity</h2>
+    <div class="log" id="log"></div>
+  </section>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmtBytes = (b) => {
+  if (b == null) return "—";
+  let n = b; const u = ["B","KiB","MiB","GiB","TiB"];
+  for (let i=0;i<u.length;i++){ if (n<1024||i===u.length-1) return (i===0?n:n.toFixed(1))+" "+u[i]; n/=1024; }
+};
+const money = (v, c) => (c||"USD")+" "+v.toFixed(2);
+
+function banner(msg, kind){
+  const el = $("banner");
+  el.textContent = msg; el.className = "banner show "+(kind||"ok");
+  if (kind==="ok") setTimeout(()=>el.classList.remove("show"), 4000);
+}
+function logLine(msg, kind){
+  const el = $("log");
+  const t = new Date().toLocaleTimeString();
+  const div = document.createElement("div");
+  div.className = "entry "+(kind||"ok");
+  div.innerHTML = `<span class="t">${t}</span><span class="m">${msg}</span>`;
+  el.prepend(div);
+}
+
+function renderTiles(s){
+  const t = s.totals, sv = s.savings;
+  const tiles = [
+    {label:"Total objects", value:t.objects, sub:fmtBytes(t.bytes)},
+    {label:"Cleanup candidates", value:t.candidates, sub:fmtBytes(t.candidate_bytes)},
+    {label:"Duplicate groups", value:t.duplicate_groups, sub:fmtBytes(t.duplicate_reclaimable)+" reclaimable"},
+    {label:"Incomplete uploads", value:t.incomplete_uploads, sub:"orphaned multipart"},
+    {label:"Reclaimable", value:fmtBytes(t.candidate_bytes), sub:"~"+money(sv.monthly,sv.currency)+"/mo · "+money(sv.yearly,sv.currency)+"/yr", cls:"accent-savings"},
+  ];
+  $("tiles").innerHTML = tiles.map(x=>`
+    <div class="tile ${x.cls||""}">
+      <div class="label">${x.label}</div>
+      <div class="value">${x.value}</div>
+      <div class="sub">${x.sub}</div>
+    </div>`).join("");
+}
+
+function renderSavings(s){
+  // Lead with reclaimable STORAGE (bytes) — meaningful at any scale. The
+  // dollar figure rounds to ~0 for a small test bucket, so it rides along
+  // as a precise sub-label rather than the headline.
+  const live = s.totals.live_bytes;
+  const candidate = s.totals.candidate_bytes;
+  const total = Math.max(live, 1);
+  const keepBytes = Math.max(live - candidate, 0);
+  const keepPct = (keepBytes/total)*100, savePct = 100-keepPct;
+  const cur = s.savings.currency;
+  $("savingsTrack").innerHTML =
+    `<div class="bar-fill" style="width:${keepPct}%;background:var(--live)"></div>`+
+    `<div class="bar-fill" style="width:${Math.max(savePct,0)}%;background:var(--candidate);margin-left:${savePct>0?2:0}px"></div>`;
+  $("savingsLegend").innerHTML =
+    `<span class="k"><span class="swatch" style="background:var(--live)"></span> Retained: ${fmtBytes(keepBytes)}</span>`+
+    `<span class="k"><span class="swatch" style="background:var(--candidate)"></span> Reclaimable: ${fmtBytes(candidate)} (~${money(s.savings.monthly,cur)}/mo · ${money(s.savings.yearly,cur)}/yr)</span>`;
+}
+
+function renderBucket(s){
+  const max = Math.max(...s.groups.map(g=>g.bytes), 1);
+  $("bucketViz").innerHTML = s.groups.map(g=>{
+    const w = (g.bytes/max)*100;
+    const isProt = g.prefix.startsWith("legal-hold");
+    const isQ = g.prefix.startsWith("_cloudcleaner");
+    const candPct = g.objects ? (g.candidates/g.objects)*100 : 0;
+    let segs;
+    if (isQ) segs = `<div class="seg" style="width:100%;background:var(--quarantine)"></div>`;
+    else if (isProt) segs = `<div class="seg" style="width:100%;background:var(--protected)"></div>`;
+    else segs = `<div class="seg" style="width:${100-candPct}%;background:var(--live)"></div>`+
+                `<div class="seg" style="width:${candPct}%;background:var(--candidate)"></div>`;
+    return `<div class="row">
+      <div class="pfx" title="${g.prefix}">${g.prefix}</div>
+      <div class="track" style="max-width:${Math.max(w,6)}%">${segs}</div>
+      <div class="meta">${g.objects} obj · ${fmtBytes(g.bytes)}</div>
+    </div>`;
+  }).join("") || `<div class="row"><div class="pfx">empty bucket</div></div>`;
+}
+
+function renderBatches(s){
+  if (!s.batches.length){ $("batches").innerHTML = `<span style="color:var(--muted)">No quarantine batches.</span>`; return; }
+  $("batches").innerHTML = s.batches.map(b=>`
+    <div style="display:flex;justify-content:space-between;padding:4px 0;">
+      <span style="font-family:ui-monospace,Menlo,monospace;font-size:12px">${b.batch_id}</span>
+      <span>${b.objects} obj · ${fmtBytes(b.bytes)} · ${b.expired?'<b style="color:var(--critical)">EXPIRED</b>':'held until '+b.purge_after.slice(0,10)}</span>
+    </div>`).join("");
+}
+
+// Each clean is a selectable step with optional inline config. Order here is
+// display order; the server runs them in a fixed safe order regardless.
+const STEPS = [
+  {name:"dedup", title:"Deduplicate", desc:"Delete redundant exact-duplicate copies, keeping one per group. Skips legal-hold & quarantine.",
+   cfg:[{flag:"keep", type:"select", label:"keep", opts:["oldest","newest"]},
+        {flag:"min_size", type:"text", label:"min bytes", placeholder:"0"}]},
+  {name:"multipart", title:"Abort incomplete uploads", desc:"Abort orphaned multipart uploads that AWS still bills for.",
+   cfg:[{flag:"older_than", type:"text", label:"older than", placeholder:"e.g. 7d"}]},
+  {name:"quarantine", title:"Quarantine stale objects", desc:"Move rule-matched candidates to the quarantine prefix (restorable).",
+   cfg:[{flag:"force", type:"check", label:"override guardrail"}]},
+  {name:"purge", title:"Purge quarantine", desc:"Permanently delete quarantined batches past their retention window.",
+   cfg:[{flag:"force", type:"check", label:"ignore retention"}], danger:true},
+  {name:"restore", title:"Restore quarantine", desc:"Return every quarantined object to its original key.", cfg:[]},
+];
+
+function renderSteps(){
+  $("stepList").innerHTML = STEPS.map(s=>`
+    <div class="step" id="step-${s.name}">
+      <div class="tick"><input type="checkbox" data-step="${s.name}"></div>
+      <div class="body"><div class="name">${s.title}</div><div class="desc">${s.desc}</div></div>
+      <div class="cfg disabled" id="cfg-${s.name}">
+        ${s.cfg.map(c=>{
+          if (c.type==="select") return `<label>${c.label} <select data-cfg="${s.name}" data-flag="${c.flag}">${c.opts.map(o=>`<option>${o}</option>`).join("")}</select></label>`;
+          if (c.type==="text") return `<label>${c.label} <input type="text" data-cfg="${s.name}" data-flag="${c.flag}" placeholder="${c.placeholder||""}"></label>`;
+          if (c.type==="check") return `<label><input type="checkbox" data-cfg="${s.name}" data-flag="${c.flag}"> ${c.label}</label>`;
+          return "";
+        }).join("")}
+      </div>
+    </div>`).join("");
+  document.querySelectorAll("[data-step]").forEach(cb=>cb.onchange=()=>{
+    const row=$("step-"+cb.dataset.step), cfg=$("cfg-"+cb.dataset.step);
+    row.classList.toggle("on", cb.checked);
+    cfg.classList.toggle("disabled", !cb.checked);
+  });
+  $("selectAll").onclick=()=>toggleAll(true);
+  $("clearAll").onclick=()=>toggleAll(false);
+  $("runBtn").onclick=runSelected;
+}
+
+function toggleAll(on){
+  document.querySelectorAll("[data-step]").forEach(cb=>{ cb.checked=on; cb.onchange(); });
+}
+
+function collectRun(){
+  const apply = document.querySelector('input[name="mode"]:checked').value==="apply";
+  const steps = {};
+  STEPS.forEach(s=>{
+    const cb=document.querySelector(`[data-step="${s.name}"]`);
+    const step={enabled:cb.checked};
+    document.querySelectorAll(`[data-cfg="${s.name}"]`).forEach(el=>{
+      step[el.dataset.flag] = el.type==="checkbox" ? el.checked : el.value;
+    });
+    steps[s.name]=step;
+  });
+  return {apply, steps};
+}
+
+let pollTimer = null;
+
+function renderProgress(p){
+  const rr=$("runResult");
+  rr.className="run-result show";
+  const pct = p.total ? Math.round((p.done/p.total)*100) : (p.running?0:100);
+  const bar = `<div class="prog"><div class="prog-fill" style="width:${pct}%"></div></div>`;
+  const cur = p.running
+    ? `<div class="line"><b>${p.message}</b></div>`+
+      (p.action ? `<div class="line">${p.action}: ${p.done}${p.total?'/'+p.total:''}${p.total?` (${pct}%)`:''} ${bar}</div>` : bar)
+    : `<div class="line"><b>${p.message}</b>${p.error?` — <span style="color:var(--critical)">${p.error}</span>`:''}</div>`;
+  const done = (p.steps_result||[]).map(m=>`<div class="line ${/error|guardrail/.test(m)?'err':''}">${m}</div>`).join("");
+  rr.innerHTML = cur + done;
+}
+
+async function pollProgress(){
+  try {
+    const res = await fetch("/api/progress");
+    const p = await res.json();
+    renderProgress(p);
+    if (p.finished){
+      clearInterval(pollTimer); pollTimer=null;
+      $("runBtn").classList.remove("spin"); setRunDisabled(false);
+      banner(p.message + (p.error?` (${p.error})`:""), p.error?"err":"ok");
+      logLine(p.message+" "+(p.steps_result||[]).join(" | "), p.error?"err":"ok");
+      if (p.state) render(p.state);
+    }
+  } catch(e){ /* transient; keep polling */ }
+}
+
+function setRunDisabled(d){ $("runBtn").disabled=d; $("selectAll").disabled=d; $("clearAll").disabled=d; }
+
+async function runSelected(){
+  if (pollTimer) return; // a run is already being tracked
+  const payload = collectRun();
+  const selected = Object.entries(payload.steps).filter(([,v])=>v.enabled).map(([k])=>k);
+  if (!selected.length){ banner("Tick at least one clean to run.","err"); return; }
+  if (payload.apply && !confirm(`Apply ${selected.length} clean(s) to the bucket? This makes real changes.`)) return;
+  $("runBtn").classList.add("spin"); setRunDisabled(true);
+  try {
+    const res = await fetch("/api/action/run", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
+    const data = await res.json();
+    if (data.error){ banner(data.error,"err"); $("runBtn").classList.remove("spin"); setRunDisabled(false); return; }
+    // start polling live progress
+    renderProgress({running:true, message:"Starting…", action:null, done:0, total:0, steps_result:[]});
+    pollTimer = setInterval(pollProgress, 400);
+  } catch(e){ banner("run failed: "+e,"err"); $("runBtn").classList.remove("spin"); setRunDisabled(false); }
+}
+
+async function resetBucket(){
+  if (!confirm("Reset the test bucket? This deletes ALL objects and repopulates the demo scenario.")) return;
+  $("resetBtn").classList.add("spin");
+  try {
+    const res = await fetch("/api/action/reset", {method:"POST"});
+    const data = await res.json();
+    banner(data.message,"ok"); logLine("reset: "+data.message,"ok");
+    if (data.state) render(data.state);
+  } catch(e){ banner("reset failed: "+e,"err"); }
+  finally { $("resetBtn").classList.remove("spin"); }
+}
+
+async function loadLarge(){
+  if (!confirm("Seed ~66 GiB of REAL data (built server-side, no upload) so dollar savings are visible?\n\nThis is real S3 storage (~$1.50/mo until you Reset or delete the bucket). Continue?")) return;
+  $("largeBtn").classList.add("spin");
+  banner("Building ~66 GiB server-side… this takes a few minutes.","ok");
+  try {
+    const res = await fetch("/api/action/reset_large", {method:"POST"});
+    const data = await res.json();
+    banner(data.message,"ok"); logLine("large seed: "+data.message,"ok");
+    if (data.state) render(data.state);
+  } catch(e){ banner("large seed failed: "+e,"err"); }
+  finally { $("largeBtn").classList.remove("spin"); }
+}
+
+async function refresh(){
+  try {
+    const res = await fetch("/api/state");
+    const s = await res.json();
+    if (s.error){ banner(s.error,"err"); return; }
+    render(s);
+  } catch(e){ banner("could not load state: "+e,"err"); }
+}
+
+function render(s){
+  $("bucketName").textContent = s.bucket;
+  renderTiles(s); renderSavings(s); renderBucket(s); renderBatches(s);
+}
+
+$("refreshBtn").onclick = refresh;
+$("resetBtn").onclick = resetBucket;
+$("largeBtn").onclick = loadLarge;
+renderSteps();
+refresh();
+</script>
+</body>
+</html>

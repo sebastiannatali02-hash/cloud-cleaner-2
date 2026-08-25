@@ -73,6 +73,20 @@ def _s3_factory(config: "Config") -> StorageAdapter:
     return S3Adapter(region=config.region, endpoint_url=config.endpoint_url)
 
 
+@register_adapter("gcs")
+def _gcs_factory(config: "Config") -> StorageAdapter:
+    from cloudcleaner.adapters.gcs import GCSAdapter
+
+    return GCSAdapter(project=config.region)
+
+
+@register_adapter("azure")
+def _azure_factory(config: "Config") -> StorageAdapter:
+    from cloudcleaner.adapters.azure import AzureAdapter
+
+    return AzureAdapter(account_url=config.endpoint_url)
+
+
 @register_adapter("memory")
 def _memory_factory(config: "Config") -> StorageAdapter:
     from cloudcleaner.adapters.memory import MemoryAdapter

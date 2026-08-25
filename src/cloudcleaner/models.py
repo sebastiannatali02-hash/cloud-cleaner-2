@@ -14,6 +14,7 @@ class StorageObject:
     size_bytes: int
     last_modified: datetime
     storage_class: str = "STANDARD"
+    etag: str | None = None
 
 
 @dataclass(frozen=True)

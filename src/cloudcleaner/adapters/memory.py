@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Iterator
+from threading import Lock
+from typing import Iterable, Iterator
 
 from cloudcleaner.models import StorageObject
 
@@ -11,6 +12,10 @@ class MemoryAdapter:
     def __init__(self):
         # bucket -> key -> (StorageObject, text content or None)
         self.buckets: dict[str, dict[str, tuple[StorageObject, str | None]]] = {}
+        # bucket -> list of multipart upload records (plain dicts)
+        self.multipart: dict[str, list[dict]] = {}
+        # guards put_if_absent so its check-and-create is atomic under threads
+        self._lock = Lock()
 
     def seed(self, bucket: str, objects: list[StorageObject]) -> None:
         store = self.buckets.setdefault(bucket, {})
@@ -35,6 +40,11 @@ class MemoryAdapter:
     def delete(self, bucket: str, key: str) -> None:
         self.buckets.get(bucket, {}).pop(key, None)
 
+    def delete_many(self, bucket: str, keys: Iterable[str]) -> None:
+        store = self.buckets.get(bucket, {})
+        for key in keys:
+            store.pop(key, None)
+
     def put_text(self, bucket: str, key: str, text: str) -> None:
         from datetime import datetime, timezone
 
@@ -45,8 +55,51 @@ class MemoryAdapter:
         )
         self.buckets.setdefault(bucket, {})[key] = (obj, text)
 
+    def put_if_absent(self, bucket: str, key: str, text: str) -> bool:
+        """Atomically create ``key`` only if absent; True if created. Mirrors
+        the S3 conditional-write semantics for tests and the memory backend."""
+        with self._lock:
+            store = self.buckets.setdefault(bucket, {})
+            if key in store:
+                return False
+            self.put_text(bucket, key, text)
+            return True
+
     def get_text(self, bucket: str, key: str) -> str:
         text = self.buckets[bucket][key][1]
         if text is None:
             raise KeyError(f"{key} has no text content")
         return text
+
+    # ----------------------------------------------------------------- #
+    # Incomplete multipart uploads (in-memory stub)
+    # ----------------------------------------------------------------- #
+    def seed_multipart(
+        self,
+        bucket: str,
+        key: str,
+        upload_id: str,
+        initiated: "datetime",
+        size_bytes: int | None = None,
+    ) -> None:
+        """Register an in-progress multipart upload for testing."""
+        self.multipart.setdefault(bucket, []).append(
+            {
+                "key": key,
+                "upload_id": upload_id,
+                "initiated": initiated,
+                "size_bytes": size_bytes,
+            }
+        )
+
+    def list_multipart_uploads(self, bucket: str) -> Iterator[dict]:
+        """Yield a copy of each incomplete multipart upload record."""
+        for record in self.multipart.get(bucket, []):
+            yield dict(record)
+
+    def abort_multipart_upload(self, bucket: str, key: str, upload_id: str) -> None:
+        """Drop the matching upload record, if present."""
+        uploads = self.multipart.get(bucket, [])
+        self.multipart[bucket] = [
+            u for u in uploads if not (u["key"] == key and u["upload_id"] == upload_id)
+        ]

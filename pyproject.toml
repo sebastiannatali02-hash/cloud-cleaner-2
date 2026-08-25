@@ -16,6 +16,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
+gcs = ["google-cloud-storage>=2.0"]
+azure = ["azure-storage-blob>=12.0", "azure-identity>=1.0"]
 
 [project.scripts]
 cloudcleaner = "cloudcleaner.cli:main"
